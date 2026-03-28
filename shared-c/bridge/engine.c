@@ -18,7 +18,7 @@
  * -------------------------------------------------------------------------- */
 
 #define WDK_ENGINE_MEMORY_LIMIT    (32 * 1024 * 1024)  /* 32 MB */
-#define WDK_ENGINE_STACK_SIZE      (1 * 1024 * 1024)   /* 1 MB */
+#define WDK_ENGINE_STACK_SIZE      (8 * 1024 * 1024)   /* 8 MB */
 #define WDK_ENGINE_MAX_JOBS        10000                /* pump safety limit */
 #define WDK_ENGINE_ERROR_BUF_SIZE  1024
 
