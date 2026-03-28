@@ -3,97 +3,88 @@
 //
 // Thread-safe wrapper around the QuickJS-based WDK engine.
 // All C engine access is serialized on a dedicated background queue.
+// Platform bridges (net, storage, platform) are wired to real iOS APIs.
 
 import Foundation
-import WDKEngineC
+import Security
 
 // MARK: - Error Types
 
-/// Errors thrown by the WDK engine.
 public enum WDKError: Error, LocalizedError, Sendable {
-    /// The C engine could not be created (memory or initialization failure).
     case engineCreationFailed
-    /// Bytecode loading failed. The associated value contains the engine error message.
     case bytecodeLoadFailed(String)
-    /// A JS function call failed. The associated value contains the engine error message.
     case callFailed(String)
-    /// The parameters provided could not be serialized to JSON.
     case invalidParams
-    /// The engine has already been destroyed.
     case engineDestroyed
 
     public var errorDescription: String? {
         switch self {
-        case .engineCreationFailed:
-            return "WDK engine creation failed"
-        case .bytecodeLoadFailed(let message):
-            return "Bytecode load failed: \(message)"
-        case .callFailed(let message):
-            return "Call failed: \(message)"
-        case .invalidParams:
-            return "Invalid parameters: could not serialize to JSON"
-        case .engineDestroyed:
-            return "Engine has been destroyed"
+        case .engineCreationFailed: return "WDK engine creation failed"
+        case .bytecodeLoadFailed(let msg): return "Bytecode load failed: \(msg)"
+        case .callFailed(let msg): return "Call failed: \(msg)"
+        case .invalidParams: return "Invalid parameters"
+        case .engineDestroyed: return "Engine has been destroyed"
         }
     }
 }
 
 // MARK: - WDKEngine
 
-/// Swift wrapper around the WDK v2 native C engine.
-///
-/// All JavaScript execution happens on a dedicated serial queue to ensure
-/// thread safety. The engine is created lazily and destroyed when this
-/// object is deallocated.
-///
-/// Usage:
-/// ```swift
-/// let engine = try await WDKEngine()
-/// try await engine.loadBytecode(fromBundle: "wallet_core")
-/// let result = try await engine.call("createWallet", params: ["network": "ethereum"])
-/// ```
 public final class WDKEngine: @unchecked Sendable {
 
-    // MARK: - Private State
-
-    /// Opaque pointer to the C engine. Only accessed on `engineQueue`.
     private var engine: OpaquePointer?
-
-    /// Serial queue that serializes all C engine access.
     private let engineQueue: DispatchQueue
-
-    /// Tracks whether the engine has been destroyed to prevent use-after-free.
     private var isDestroyed = false
 
-    /// Platform providers retained for the engine's lifetime.
-    /// The C bridge holds raw pointers into these, so they must not be deallocated
-    /// until the engine is destroyed.
-    private var networkProvider: WDKNetworkProviderBridge?
-    private var storageProvider: WDKStorageProviderBridge?
-    private var platformProvider: WDKPlatformProviderBridge?
+    // Keep static strings alive for the C provider struct
+    private static let osNameCStr = strdup("ios")!
+    private static let versionCStr = strdup("0.1.0")!
 
-    // MARK: - Initialization
-
-    /// Creates a new WDK engine instance.
-    ///
-    /// The engine is created on a dedicated background queue. Platform bridges
-    /// (network, storage, platform) are automatically registered.
-    ///
-    /// - Throws: `WDKError.engineCreationFailed` if the C engine cannot be initialized.
     public init() async throws {
         self.engineQueue = DispatchQueue(
-            label: "com.aspect.wdk.engine",
+            label: "com.tetherto.wdk.engine",
             qos: .userInitiated
         )
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             self.engineQueue.async {
                 guard let ptr = wdk_engine_create() else {
-                    continuation.resume(throwing: WDKError.engineCreationFailed)
+                    cont.resume(throwing: WDKError.engineCreationFailed)
                     return
                 }
                 self.engine = ptr
-                continuation.resume()
+
+                // Register platform bridges with real iOS implementations
+                let ctx = wdk_engine_get_context(ptr)
+
+                // Platform bridge (os, random, log)
+                var platformProvider = WDKPlatformProvider(
+                    os_name: WDKEngine.osNameCStr,
+                    engine_version: WDKEngine.versionCStr,
+                    get_random_bytes: iosGetRandomBytes,
+                    log_message: iosLogMessage
+                )
+                wdk_register_platform_bridge(ctx, &platformProvider)
+
+                // Storage bridge (Keychain + UserDefaults)
+                var storageProvider = WDKStorageProvider(
+                    secure_set: iosSecureSet,
+                    secure_get: iosSecureGet,
+                    secure_delete: iosSecureDelete,
+                    secure_has: iosSecureHas,
+                    regular_set: iosRegularSet,
+                    regular_get: iosRegularGet,
+                    regular_delete: iosRegularDelete
+                )
+                wdk_register_storage_bridge(ctx, &storageProvider)
+
+                // Network bridge (URLSession)
+                var netProvider = WDKNetProvider(
+                    fetch: iosFetch
+                )
+                wdk_register_net_bridge(ctx, &netProvider)
+
+                cont.resume()
             }
         }
     }
@@ -101,223 +92,315 @@ public final class WDKEngine: @unchecked Sendable {
     deinit {
         let engine = self.engine
         let queue = self.engineQueue
-        // Prevent double-free
         self.engine = nil
         self.isDestroyed = true
-
         queue.async {
-            if let engine = engine {
-                wdk_engine_destroy(engine)
-            }
+            if let engine = engine { wdk_engine_destroy(engine) }
         }
     }
 
-    // MARK: - Bytecode Loading
+    // MARK: - Public API
 
-    /// Loads compiled QuickJS bytecode from the app bundle.
-    ///
-    /// - Parameter name: The resource name (without extension) of the `.qbc` file in the main bundle.
-    /// - Throws: `WDKError.bytecodeLoadFailed` if the file cannot be found or loaded.
     public func loadBytecode(fromBundle name: String) async throws {
         guard let url = Bundle.main.url(forResource: name, withExtension: "qbc") else {
-            throw WDKError.bytecodeLoadFailed("Resource '\(name).qbc' not found in main bundle")
+            throw WDKError.bytecodeLoadFailed("Resource '\(name).qbc' not found")
         }
-
-        let data = try Data(contentsOf: url)
-        try await loadBytecode(data: data)
+        try await loadBytecode(data: Data(contentsOf: url))
     }
 
-    /// Loads compiled QuickJS bytecode from raw data.
-    ///
-    /// - Parameter data: The bytecode data (typically produced by `qjsc`).
-    /// - Throws: `WDKError.bytecodeLoadFailed` if the bytecode is invalid or cannot be evaluated.
     public func loadBytecode(data: Data) async throws {
         try await onEngineQueue { engine in
-            let result = data.withUnsafeBytes { (rawBuffer: UnsafeRawBufferPointer) -> Int32 in
-                guard let baseAddress = rawBuffer.baseAddress else { return -1 }
-                let ptr = baseAddress.assumingMemoryBound(to: UInt8.self)
-                return wdk_engine_load_bytecode(engine, ptr, rawBuffer.count)
+            let result = data.withUnsafeBytes { buf -> Int32 in
+                guard let base = buf.baseAddress else { return -1 }
+                return wdk_engine_load_bytecode(engine, base.assumingMemoryBound(to: UInt8.self), buf.count)
             }
-
             if result != 0 {
-                let errorMessage = self.getError(engine)
-                throw WDKError.bytecodeLoadFailed(errorMessage)
+                throw WDKError.bytecodeLoadFailed(self.getError(engine))
             }
-
-            // Pump the event loop after loading to process any initialization jobs
             _ = wdk_engine_pump(engine)
         }
     }
 
-    // MARK: - JS Calls
+    public func loadJS(source: String) async throws {
+        try await onEngineQueue { engine in
+            let result = wdk_engine_eval(engine, source)
+            if result != 0 {
+                throw WDKError.bytecodeLoadFailed(self.getError(engine))
+            }
+        }
+    }
 
-    /// Calls a function on the global `wdk` object in the JavaScript context.
-    ///
-    /// The function is looked up as `globalThis.wdk[method]`. Parameters are
-    /// serialized to JSON and passed as a single argument. The return value
-    /// is the parsed JSON result.
-    ///
-    /// - Parameters:
-    ///   - method: The function name on the `wdk` object.
-    ///   - params: A JSON-serializable dictionary of parameters. Pass `nil` for no arguments.
-    /// - Returns: The deserialized JSON result (can be `String`, `[String: Any]`, `[Any]`, `NSNumber`, or `NSNull`).
-    /// - Throws: `WDKError.callFailed` if the JS function throws or does not exist.
     public func call(_ method: String, params: [String: Any]? = nil) async throws -> Any {
         let jsonArgs: String
         if let params = params {
-            guard JSONSerialization.isValidJSONObject(params) else {
-                throw WDKError.invalidParams
-            }
-            let data = try JSONSerialization.data(withJSONObject: params)
-            guard let str = String(data: data, encoding: .utf8) else {
-                throw WDKError.invalidParams
-            }
-            jsonArgs = str
+            guard JSONSerialization.isValidJSONObject(params) else { throw WDKError.invalidParams }
+            jsonArgs = String(data: try JSONSerialization.data(withJSONObject: params), encoding: .utf8) ?? "{}"
         } else {
             jsonArgs = "{}"
         }
 
         return try await onEngineQueue { engine in
             guard let resultPtr = wdk_engine_call(engine, method, jsonArgs) else {
-                let errorMessage = self.getError(engine)
-                throw WDKError.callFailed(errorMessage)
+                throw WDKError.callFailed(self.getError(engine))
             }
-
             let resultString = String(cString: resultPtr)
             wdk_free_string(resultPtr)
-
-            // Pump the event loop to process any pending microtasks
             _ = wdk_engine_pump(engine)
 
-            // Parse the JSON result
-            guard let resultData = resultString.data(using: .utf8),
-                  let parsed = try? JSONSerialization.jsonObject(with: resultData, options: .fragmentsAllowed) else {
-                return resultString as Any
+            if let data = resultString.data(using: .utf8),
+               let parsed = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) {
+                return parsed
             }
-
-            return parsed
+            return resultString as Any
         }
     }
 
-    /// Calls a function on the global `wdk` object with a pre-encoded JSON string.
-    ///
-    /// This is useful when you already have a JSON string and want to avoid
-    /// double-serialization overhead.
-    ///
-    /// - Parameters:
-    ///   - method: The function name on the `wdk` object.
-    ///   - jsonArgs: A valid JSON string to pass as the argument.
-    /// - Returns: The raw JSON string result.
-    /// - Throws: `WDKError.callFailed` if the JS function throws or does not exist.
-    public func call(_ method: String, jsonArgs: String) async throws -> String {
+    public func evalString(_ js: String) async throws -> String? {
         try await onEngineQueue { engine in
-            guard let resultPtr = wdk_engine_call(engine, method, jsonArgs) else {
-                let errorMessage = self.getError(engine)
-                throw WDKError.callFailed(errorMessage)
+            guard let resultPtr = wdk_engine_eval_string(engine, js) else {
+                return nil
             }
-
             let result = String(cString: resultPtr)
             wdk_free_string(resultPtr)
-
-            _ = wdk_engine_pump(engine)
-
             return result
-        }
-    }
-
-    /// Evaluates raw JavaScript code in the engine context.
-    ///
-    /// This is primarily intended for testing and debugging. In production,
-    /// prefer `call(_:params:)` which uses the structured `wdk` API.
-    ///
-    /// - Parameter js: JavaScript source code to evaluate.
-    /// - Returns: The JSON-stringified result, or `nil` if the result is `undefined`.
-    /// - Throws: `WDKError.callFailed` if the evaluation throws an error.
-    public func eval(_ js: String) async throws -> String? {
-        // Wrap the JS code in a function call via the engine's call mechanism.
-        // We use a special pattern: call a synthetic evaluator by passing the
-        // code as a JSON-encoded string argument.
-        try await onEngineQueue { engine in
-            // Use wdk_engine_call with a special "__eval" method if available,
-            // otherwise fall back to calling via the raw engine interface.
-            // For now, we encode the JS as a JSON argument to an eval wrapper.
-            let escapedJS: String
-            if let jsonData = try? JSONSerialization.data(withJSONObject: js),
-               let jsonStr = String(data: jsonData, encoding: .utf8) {
-                escapedJS = "{\"code\":\(jsonStr)}"
-            } else {
-                throw WDKError.invalidParams
-            }
-
-            guard let resultPtr = wdk_engine_call(engine, "__eval", escapedJS) else {
-                let errorMessage = self.getError(engine)
-                throw WDKError.callFailed(errorMessage)
-            }
-
-            let result = String(cString: resultPtr)
-            wdk_free_string(resultPtr)
-
-            _ = wdk_engine_pump(engine)
-
-            return result == "undefined" ? nil : result
         }
     }
 
     // MARK: - Private Helpers
 
-    /// Executes a closure on the engine queue, ensuring the engine is alive.
     private func onEngineQueue<T>(_ work: @escaping (OpaquePointer) throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
             engineQueue.async {
                 guard !self.isDestroyed, let engine = self.engine else {
-                    continuation.resume(throwing: WDKError.engineDestroyed)
-                    return
+                    cont.resume(throwing: WDKError.engineDestroyed); return
                 }
-                do {
-                    let result = try work(engine)
-                    continuation.resume(returning: result)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
+                do { cont.resume(returning: try work(engine)) }
+                catch { cont.resume(throwing: error) }
             }
         }
     }
 
-    /// Retrieves the last error message from the C engine.
-    /// Must be called on `engineQueue`.
     private func getError(_ engine: OpaquePointer) -> String {
-        if let errPtr = wdk_engine_get_error(engine) {
-            return String(cString: errPtr)
+        if let p = wdk_engine_get_error(engine) { return String(cString: p) }
+        return "Unknown error"
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// MARK: - Platform Bridge: Random + Log
+// ════════════════════════════════════════════════════════════════════
+
+private func iosGetRandomBytes(_ buf: UnsafeMutablePointer<UInt8>?, _ len: Int) -> Int32 {
+    guard let buf = buf, len > 0 else { return -1 }
+    return SecRandomCopyBytes(kSecRandomDefault, len, buf) == errSecSuccess ? 0 : -1
+}
+
+private func iosLogMessage(_ level: Int32, _ message: UnsafePointer<CChar>?) {
+    guard let message = message else { return }
+    let msg = String(cString: message)
+    switch level {
+    case 0: print("[WDK DEBUG] \(msg)")
+    case 1: print("[WDK INFO] \(msg)")
+    case 2: print("[WDK WARN] \(msg)")
+    case 3: print("[WDK ERROR] \(msg)")
+    default: print("[WDK] \(msg)")
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// MARK: - Storage Bridge: Keychain (secure) + UserDefaults (regular)
+// ════════════════════════════════════════════════════════════════════
+
+private let keychainService = "com.tetherto.wdk"
+private let defaultsSuite = "com.tetherto.wdk.storage"
+
+// -- Secure: Keychain --
+
+private func iosSecureSet(_ key: UnsafePointer<CChar>?, _ value: UnsafePointer<UInt8>?, _ valueLen: Int) -> Int32 {
+    guard let key = key, let value = value, valueLen > 0 else { return -1 }
+    let keyStr = String(cString: key)
+    let data = Data(bytes: value, count: valueLen)
+
+    // Delete existing first
+    let deleteQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keyStr,
+    ]
+    SecItemDelete(deleteQuery as CFDictionary)
+
+    // Add new
+    let addQuery: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keyStr,
+        kSecValueData as String: data,
+        kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+    ]
+    let status = SecItemAdd(addQuery as CFDictionary, nil)
+    return status == errSecSuccess ? 0 : -1
+}
+
+private func iosSecureGet(_ key: UnsafePointer<CChar>?,
+                           _ outValue: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>?,
+                           _ outLen: UnsafeMutablePointer<Int>?) -> Int32 {
+    guard let key = key, let outValue = outValue, let outLen = outLen else { return -1 }
+    let keyStr = String(cString: key)
+
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keyStr,
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+
+    var result: AnyObject?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+    if status == errSecSuccess, let data = result as? Data {
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: data.count)
+        data.copyBytes(to: buf, count: data.count)
+        outValue.pointee = buf
+        outLen.pointee = data.count
+        return 0
+    }
+
+    outValue.pointee = nil
+    outLen.pointee = 0
+    return -1
+}
+
+private func iosSecureDelete(_ key: UnsafePointer<CChar>?) -> Int32 {
+    guard let key = key else { return -1 }
+    let keyStr = String(cString: key)
+
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keyStr,
+    ]
+    let status = SecItemDelete(query as CFDictionary)
+    return (status == errSecSuccess || status == errSecItemNotFound) ? 0 : -1
+}
+
+private func iosSecureHas(_ key: UnsafePointer<CChar>?) -> Int32 {
+    guard let key = key else { return 0 }
+    let keyStr = String(cString: key)
+
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keyStr,
+        kSecReturnData as String: false,
+    ]
+    return SecItemCopyMatching(query as CFDictionary, nil) == errSecSuccess ? 1 : 0
+}
+
+// -- Regular: UserDefaults --
+
+private func iosRegularSet(_ key: UnsafePointer<CChar>?, _ value: UnsafePointer<CChar>?) -> Int32 {
+    guard let key = key, let value = value else { return -1 }
+    let defaults = UserDefaults(suiteName: defaultsSuite) ?? UserDefaults.standard
+    defaults.set(String(cString: value), forKey: String(cString: key))
+    return defaults.synchronize() ? 0 : -1
+}
+
+private func iosRegularGet(_ key: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
+    guard let key = key else { return nil }
+    let defaults = UserDefaults(suiteName: defaultsSuite) ?? UserDefaults.standard
+    guard let value = defaults.string(forKey: String(cString: key)) else { return nil }
+    return strdup(value)
+}
+
+private func iosRegularDelete(_ key: UnsafePointer<CChar>?) -> Int32 {
+    guard let key = key else { return -1 }
+    let defaults = UserDefaults(suiteName: defaultsSuite) ?? UserDefaults.standard
+    defaults.removeObject(forKey: String(cString: key))
+    return 0
+}
+
+// ════════════════════════════════════════════════════════════════════
+// MARK: - Network Bridge: URLSession
+// ════════════════════════════════════════════════════════════════════
+
+private func iosFetch(
+    _ url: UnsafePointer<CChar>?,
+    _ method: UnsafePointer<CChar>?,
+    _ headersJson: UnsafePointer<CChar>?,
+    _ body: UnsafePointer<UInt8>?,
+    _ bodyLen: Int,
+    _ timeoutMs: Int32,
+    _ context: UnsafeMutableRawPointer?,
+    _ callback: (@convention(c) (UnsafeMutableRawPointer?, Int32,
+                                  UnsafePointer<CChar>?,
+                                  UnsafePointer<UInt8>?, Int,
+                                  UnsafePointer<CChar>?) -> Void)?
+) {
+    guard let url = url, let callback = callback else {
+        callback?(context, 0, nil, nil, 0, "Invalid parameters")
+        return
+    }
+
+    let urlStr = String(cString: url)
+    let methodStr = method != nil ? String(cString: method!) : "GET"
+
+    guard let requestURL = URL(string: urlStr) else {
+        callback(context, 0, nil, nil, 0, "Invalid URL")
+        return
+    }
+
+    var request = URLRequest(url: requestURL)
+    request.httpMethod = methodStr
+    request.timeoutInterval = timeoutMs > 0 ? TimeInterval(timeoutMs) / 1000.0 : 30.0
+
+    // Parse headers
+    if let headersJson = headersJson {
+        let headersStr = String(cString: headersJson)
+        if let data = headersStr.data(using: .utf8),
+           let headers = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            for (key, value) in headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
         }
-        return "Unknown engine error"
     }
-}
 
-// MARK: - Internal Bridge Wrappers
-
-/// Retains the C struct and its backing closures for the network provider bridge.
-internal final class WDKNetworkProviderBridge {
-    var cProvider: WDKNetProvider
-
-    init(_ cProvider: WDKNetProvider) {
-        self.cProvider = cProvider
+    // Set body
+    if let body = body, bodyLen > 0 {
+        request.httpBody = Data(bytes: body, count: bodyLen)
     }
-}
 
-/// Retains the C struct and its backing closures for the storage provider bridge.
-internal final class WDKStorageProviderBridge {
-    var cProvider: WDKStorageProvider
+    // Perform async request
+    let task = URLSession.shared.dataTask(with: request) { data, response, error in
+        if let error = error {
+            let errStr = error.localizedDescription
+            errStr.withCString { errCStr in
+                callback(context, 0, nil, nil, 0, errCStr)
+            }
+            return
+        }
 
-    init(_ cProvider: WDKStorageProvider) {
-        self.cProvider = cProvider
+        let httpResponse = response as? HTTPURLResponse
+        let statusCode = Int32(httpResponse?.statusCode ?? 0)
+
+        // Serialize response headers as JSON
+        var headersDict: [String: String] = [:]
+        if let allHeaders = httpResponse?.allHeaderFields {
+            for (key, value) in allHeaders {
+                headersDict["\(key)"] = "\(value)"
+            }
+        }
+        let headersJsonStr = (try? JSONSerialization.data(withJSONObject: headersDict))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+        let bodyData = data ?? Data()
+
+        headersJsonStr.withCString { headersCStr in
+            bodyData.withUnsafeBytes { bodyBuf in
+                let bodyPtr = bodyBuf.baseAddress?.assumingMemoryBound(to: UInt8.self)
+                callback(context, statusCode, headersCStr, bodyPtr, bodyData.count, nil)
+            }
+        }
     }
-}
-
-/// Retains the C struct and its backing closures for the platform provider bridge.
-internal final class WDKPlatformProviderBridge {
-    var cProvider: WDKPlatformProvider
-
-    init(_ cProvider: WDKPlatformProvider) {
-        self.cProvider = cProvider
-    }
+    task.resume()
 }
