@@ -16,6 +16,9 @@
  *   native.crypto.hmacSha256(key, data)
  *   native.crypto.hmacSha512(key, data)
  *   native.crypto.pbkdf2(password, salt, iterations, keyLen, hash)
+ *   native.crypto.hkdf(ikm, salt, info, keyLen, hash)
+ *   native.crypto.aesGcmEncrypt(key, plaintext, iv)
+ *   native.crypto.aesGcmDecrypt(key, ciphertext, iv)
  *   native.crypto.releaseKey(handle)
  */
 
@@ -27,6 +30,9 @@
 #include "../hashing/keccak256.h"
 #include "../hashing/ripemd160.h"
 #include "../hashing/blake2b.h"
+#include "../hashing/pbkdf2.h"
+#include "../hashing/hkdf.h"
+#include "../hashing/aes_gcm.h"
 #include "../bip/bip39.h"
 #include "../bip/bip32.h"
 
@@ -35,6 +41,53 @@
 #include <stdlib.h>
 
 #include "ed25519_derive.h"
+
+/*
+ * Helper: Get raw bytes from either a Uint8Array or ArrayBuffer.
+ * QuickJS's JS_GetArrayBuffer only works on raw ArrayBuffer, not TypedArrays.
+ * This helper handles both by checking for the .buffer property.
+ * Caller must call JS_FreeValue on *buf_val_out when done.
+ */
+static uint8_t *get_bytes(JSContext *ctx, JSValueConst val,
+                           size_t *out_len, JSValue *buf_val_out) {
+    uint8_t *ptr;
+
+    /* First try as direct ArrayBuffer */
+    ptr = JS_GetArrayBuffer(ctx, out_len, val);
+    if (ptr) {
+        *buf_val_out = JS_UNDEFINED;
+        return ptr;
+    }
+
+    /* Try as TypedArray: get .buffer, .byteOffset, .byteLength */
+    JSValue buffer = JS_GetPropertyStr(ctx, val, "buffer");
+    if (JS_IsUndefined(buffer)) {
+        *buf_val_out = JS_UNDEFINED;
+        *out_len = 0;
+        return NULL;
+    }
+
+    size_t buf_len;
+    ptr = JS_GetArrayBuffer(ctx, &buf_len, buffer);
+    if (!ptr) {
+        JS_FreeValue(ctx, buffer);
+        *buf_val_out = JS_UNDEFINED;
+        *out_len = 0;
+        return NULL;
+    }
+
+    JSValue offset_val = JS_GetPropertyStr(ctx, val, "byteOffset");
+    JSValue length_val = JS_GetPropertyStr(ctx, val, "byteLength");
+    int32_t offset = 0, length = (int32_t)buf_len;
+    JS_ToInt32(ctx, &offset, offset_val);
+    JS_ToInt32(ctx, &length, length_val);
+    JS_FreeValue(ctx, offset_val);
+    JS_FreeValue(ctx, length_val);
+
+    *out_len = (size_t)length;
+    *buf_val_out = buffer; /* Caller must free this */
+    return ptr + offset;
+}
 
 /* Alias key store types to match our naming convention */
 typedef int32_t WDKKeyHandle;
@@ -457,6 +510,242 @@ static JSValue js_crypto_hmac_sha512(JSContext *ctx, JSValueConst this_val,
     return js_new_uint8array(ctx, out, 64);
 }
 
+/* ── native.crypto.pbkdf2(password, salt, iterations, keyLen, hash) ── */
+
+static JSValue js_crypto_pbkdf2(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    if (argc < 5) return JS_ThrowTypeError(ctx, "pbkdf2 requires 5 args: password, salt, iterations, keyLen, hash");
+
+    size_t pw_len, salt_len;
+    JSValue pw_buf = JS_UNDEFINED, salt_buf = JS_UNDEFINED;
+    uint8_t *pw = get_bytes(ctx, argv[0], &pw_len, &pw_buf);
+    uint8_t *salt = get_bytes(ctx, argv[1], &salt_len, &salt_buf);
+    if (!pw || !salt) {
+        JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+        return JS_ThrowTypeError(ctx, "password and salt must be Uint8Array");
+    }
+
+    int32_t iterations, key_len;
+    JS_ToInt32(ctx, &iterations, argv[2]);
+    JS_ToInt32(ctx, &key_len, argv[3]);
+
+    const char *hash = JS_ToCString(ctx, argv[4]);
+    if (!hash) {
+        JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+        return JS_ThrowTypeError(ctx, "hash must be string");
+    }
+
+    if (iterations < 1 || key_len < 1 || key_len > 1024) {
+        JS_FreeCString(ctx, hash);
+        JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+        return JS_ThrowRangeError(ctx, "Invalid iterations or keyLen");
+    }
+
+    uint8_t *out = (uint8_t *)js_malloc(ctx, key_len);
+    if (!out) {
+        JS_FreeCString(ctx, hash);
+        JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    int rc;
+    if (strcmp(hash, "sha256") == 0) {
+        rc = wdk_pbkdf2_sha256(pw, pw_len, salt, salt_len, (uint32_t)iterations, out, (size_t)key_len);
+    } else if (strcmp(hash, "sha512") == 0) {
+        rc = wdk_pbkdf2_sha512(pw, pw_len, salt, salt_len, (uint32_t)iterations, out, (size_t)key_len);
+    } else {
+        JS_FreeCString(ctx, hash);
+        js_free(ctx, out);
+        JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+        return JS_ThrowRangeError(ctx, "hash must be 'sha256' or 'sha512'");
+    }
+
+    JS_FreeCString(ctx, hash);
+    JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
+
+    if (rc != 0) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "PBKDF2 failed");
+    }
+
+    JSValue ab = JS_NewArrayBufferCopy(ctx, out, key_len);
+    js_free(ctx, out);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue result = JS_CallConstructor(ctx, u8_ctor, 1, &ab);
+    JS_FreeValue(ctx, u8_ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    return result;
+}
+
+/* ── native.crypto.hkdf(ikm, salt, info, keyLen, hash) ────── */
+
+static JSValue js_crypto_hkdf(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    if (argc < 5) return JS_ThrowTypeError(ctx, "hkdf requires 5 args: ikm, salt, info, keyLen, hash");
+
+    size_t ikm_len, salt_len, info_len;
+    JSValue ikm_buf = JS_UNDEFINED, salt_buf = JS_UNDEFINED, info_buf = JS_UNDEFINED;
+    uint8_t *ikm = get_bytes(ctx, argv[0], &ikm_len, &ikm_buf);
+    uint8_t *salt = get_bytes(ctx, argv[1], &salt_len, &salt_buf);
+    uint8_t *info = get_bytes(ctx, argv[2], &info_len, &info_buf);
+    if (!ikm) {
+        JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+        return JS_ThrowTypeError(ctx, "ikm must be Uint8Array");
+    }
+
+    int32_t key_len;
+    JS_ToInt32(ctx, &key_len, argv[3]);
+
+    const char *hash = JS_ToCString(ctx, argv[4]);
+    if (!hash) {
+        JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+        return JS_ThrowTypeError(ctx, "hash must be string");
+    }
+
+    if (key_len < 1 || key_len > 1024) {
+        JS_FreeCString(ctx, hash);
+        JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+        return JS_ThrowRangeError(ctx, "Invalid keyLen");
+    }
+
+    uint8_t *out = (uint8_t *)js_malloc(ctx, key_len);
+    if (!out) {
+        JS_FreeCString(ctx, hash);
+        JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    int rc;
+    if (strcmp(hash, "sha256") == 0) {
+        rc = wdk_hkdf_sha256(ikm, ikm_len, salt, salt_len, info, info_len, out, (size_t)key_len);
+    } else if (strcmp(hash, "sha512") == 0) {
+        rc = wdk_hkdf_sha512(ikm, ikm_len, salt, salt_len, info, info_len, out, (size_t)key_len);
+    } else {
+        JS_FreeCString(ctx, hash);
+        js_free(ctx, out);
+        JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+        return JS_ThrowRangeError(ctx, "hash must be 'sha256' or 'sha512'");
+    }
+
+    JS_FreeCString(ctx, hash);
+    JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
+
+    if (rc != 0) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "HKDF failed");
+    }
+
+    JSValue ab = JS_NewArrayBufferCopy(ctx, out, key_len);
+    js_free(ctx, out);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue result = JS_CallConstructor(ctx, u8_ctor, 1, &ab);
+    JS_FreeValue(ctx, u8_ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    return result;
+}
+
+/* ── native.crypto.aesGcmEncrypt(key, plaintext, iv) ──────── */
+
+static JSValue js_crypto_aes_gcm_encrypt(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "aesGcmEncrypt requires key, plaintext, iv");
+
+    size_t key_len, pt_len, iv_len;
+    JSValue key_buf = JS_UNDEFINED, pt_buf = JS_UNDEFINED, iv_buf = JS_UNDEFINED;
+    uint8_t *key = get_bytes(ctx, argv[0], &key_len, &key_buf);
+    uint8_t *plaintext = get_bytes(ctx, argv[1], &pt_len, &pt_buf);
+    uint8_t *iv = get_bytes(ctx, argv[2], &iv_len, &iv_buf);
+
+    if (!key || key_len != 32) {
+        JS_FreeValue(ctx, key_buf); JS_FreeValue(ctx, pt_buf); JS_FreeValue(ctx, iv_buf);
+        return JS_ThrowTypeError(ctx, "key must be 32-byte Uint8Array");
+    }
+    if (!iv || iv_len != 12) {
+        JS_FreeValue(ctx, key_buf); JS_FreeValue(ctx, pt_buf); JS_FreeValue(ctx, iv_buf);
+        return JS_ThrowTypeError(ctx, "iv must be 12-byte Uint8Array");
+    }
+    if (!plaintext) {
+        JS_FreeValue(ctx, key_buf); JS_FreeValue(ctx, pt_buf); JS_FreeValue(ctx, iv_buf);
+        return JS_ThrowTypeError(ctx, "plaintext must be Uint8Array");
+    }
+
+    size_t out_len = pt_len + 16; /* ciphertext + 16-byte tag */
+    uint8_t *out = (uint8_t *)js_malloc(ctx, out_len);
+    if (!out) return JS_ThrowOutOfMemory(ctx);
+
+    int rc = wdk_aes_gcm_encrypt(key, iv, plaintext, pt_len, NULL, 0, out);
+    JS_FreeValue(ctx, key_buf); JS_FreeValue(ctx, pt_buf); JS_FreeValue(ctx, iv_buf);
+    if (rc != 0) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "AES-GCM encrypt failed");
+    }
+
+    JSValue ab = JS_NewArrayBufferCopy(ctx, out, out_len);
+    js_free(ctx, out);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue result = JS_CallConstructor(ctx, u8_ctor, 1, &ab);
+    JS_FreeValue(ctx, u8_ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    return result;
+}
+
+/* ── native.crypto.aesGcmDecrypt(key, ciphertext, iv) ──────── */
+
+static JSValue js_crypto_aes_gcm_decrypt(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "aesGcmDecrypt requires key, ciphertext, iv");
+
+    size_t key_len, ct_len, iv_len;
+    JSValue dk_buf = JS_UNDEFINED, dct_buf = JS_UNDEFINED, div_buf = JS_UNDEFINED;
+    uint8_t *key = get_bytes(ctx, argv[0], &key_len, &dk_buf);
+    uint8_t *ciphertext = get_bytes(ctx, argv[1], &ct_len, &dct_buf);
+    uint8_t *iv = get_bytes(ctx, argv[2], &iv_len, &div_buf);
+
+    if (!key || key_len != 32) {
+        JS_FreeValue(ctx, dk_buf); JS_FreeValue(ctx, dct_buf); JS_FreeValue(ctx, div_buf);
+        return JS_ThrowTypeError(ctx, "key must be 32-byte Uint8Array");
+    }
+    if (!iv || iv_len != 12) {
+        JS_FreeValue(ctx, dk_buf); JS_FreeValue(ctx, dct_buf); JS_FreeValue(ctx, div_buf);
+        return JS_ThrowTypeError(ctx, "iv must be 12-byte Uint8Array");
+    }
+    if (!ciphertext || ct_len < 16) {
+        JS_FreeValue(ctx, dk_buf); JS_FreeValue(ctx, dct_buf); JS_FreeValue(ctx, div_buf);
+        return JS_ThrowTypeError(ctx, "ciphertext must be Uint8Array with at least 16 bytes (tag)");
+    }
+
+    size_t pt_len = ct_len - 16;
+    uint8_t *out = (uint8_t *)js_malloc(ctx, pt_len > 0 ? pt_len : 1);
+    if (!out) return JS_ThrowOutOfMemory(ctx);
+
+    int rc = wdk_aes_gcm_decrypt(key, iv, ciphertext, ct_len, NULL, 0, out);
+    JS_FreeValue(ctx, dk_buf); JS_FreeValue(ctx, dct_buf); JS_FreeValue(ctx, div_buf);
+    if (rc != 0) {
+        js_free(ctx, out);
+        return JS_ThrowInternalError(ctx, "AES-GCM decrypt failed: authentication tag mismatch");
+    }
+
+    JSValue ab = JS_NewArrayBufferCopy(ctx, out, pt_len);
+    js_free(ctx, out);
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue u8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue result = JS_CallConstructor(ctx, u8_ctor, 1, &ab);
+    JS_FreeValue(ctx, u8_ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    return result;
+}
+
 /* ── native.crypto.releaseKey(handle) ──────────────────────── */
 
 static JSValue js_crypto_release_key(JSContext *ctx, JSValueConst this_val,
@@ -509,6 +798,14 @@ void wdk_register_crypto_bridge(JSContext *ctx) {
         JS_NewCFunction(ctx, js_crypto_hmac_sha256, "hmacSha256", 2));
     JS_SetPropertyStr(ctx, crypto, "hmacSha512",
         JS_NewCFunction(ctx, js_crypto_hmac_sha512, "hmacSha512", 2));
+    JS_SetPropertyStr(ctx, crypto, "pbkdf2",
+        JS_NewCFunction(ctx, js_crypto_pbkdf2, "pbkdf2", 5));
+    JS_SetPropertyStr(ctx, crypto, "hkdf",
+        JS_NewCFunction(ctx, js_crypto_hkdf, "hkdf", 5));
+    JS_SetPropertyStr(ctx, crypto, "aesGcmEncrypt",
+        JS_NewCFunction(ctx, js_crypto_aes_gcm_encrypt, "aesGcmEncrypt", 3));
+    JS_SetPropertyStr(ctx, crypto, "aesGcmDecrypt",
+        JS_NewCFunction(ctx, js_crypto_aes_gcm_decrypt, "aesGcmDecrypt", 3));
     JS_SetPropertyStr(ctx, crypto, "releaseKey",
         JS_NewCFunction(ctx, js_crypto_release_key, "releaseKey", 1));
 

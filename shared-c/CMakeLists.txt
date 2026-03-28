@@ -55,6 +55,9 @@ add_library(wdk_hashing STATIC
     hashing/keccak256.c
     hashing/ripemd160.c
     hashing/blake2b.c
+    hashing/pbkdf2.c
+    hashing/hkdf.c
+    hashing/aes_gcm.c
 )
 target_include_directories(wdk_hashing PUBLIC hashing)
 
