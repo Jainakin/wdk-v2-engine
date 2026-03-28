@@ -66,78 +66,8 @@ int wdk_secp256k1_pubkey_from_privkey(const uint8_t privkey[32],
     return 0;
 }
 
-/* ── Helpers ───────────────────────────────────────────────── */
-
-/*
- * Extract bytes from a JS Uint8Array argument.
- * Returns pointer to bytes and sets *out_len.
- * Caller must NOT free the returned pointer — it points into the JS ArrayBuffer.
- *
- * For QuickJS-NG, Uint8Array is a typed array. We get the underlying
- * ArrayBuffer and then get its data pointer.
- */
-static uint8_t *js_get_uint8array(JSContext *ctx, JSValueConst val,
-                                    size_t *out_len) {
-    /* Try direct ArrayBuffer first */
-    size_t len = 0;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &len, val);
-    if (buf) {
-        *out_len = len;
-        return buf;
-    }
-
-    /* Try typed array: get .buffer property */
-    JSValue buffer = JS_GetPropertyStr(ctx, val, "buffer");
-    if (JS_IsException(buffer)) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    buf = JS_GetArrayBuffer(ctx, &len, buffer);
-
-    /* Get byteOffset and byteLength for the view */
-    if (buf) {
-        JSValue offset_val = JS_GetPropertyStr(ctx, val, "byteOffset");
-        JSValue length_val = JS_GetPropertyStr(ctx, val, "byteLength");
-        int32_t offset = 0, length = (int32_t)len;
-        JS_ToInt32(ctx, &offset, offset_val);
-        JS_ToInt32(ctx, &length, length_val);
-        JS_FreeValue(ctx, offset_val);
-        JS_FreeValue(ctx, length_val);
-
-        /* Bounds validation: offset + length must not exceed buffer */
-        if (offset < 0 || length < 0 ||
-            (size_t)offset + (size_t)length > len) {
-            JS_FreeValue(ctx, buffer);
-            *out_len = 0;
-            return NULL;
-        }
-
-        buf = buf + offset;
-        *out_len = (size_t)length;
-    } else {
-        *out_len = 0;
-    }
-
-    JS_FreeValue(ctx, buffer);
-    return buf;
-}
-
-/*
- * Create a JS Uint8Array from C bytes.
- */
-static JSValue js_new_uint8array(JSContext *ctx, const uint8_t *data,
-                                   size_t len) {
-    /* Create a proper Uint8Array (not raw ArrayBuffer) so JS can use .length */
-    JSValue ab = JS_NewArrayBufferCopy(ctx, data, len);
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue uint8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
-    JSValue result = JS_CallConstructor(ctx, uint8_ctor, 1, &ab);
-    JS_FreeValue(ctx, uint8_ctor);
-    JS_FreeValue(ctx, global);
-    JS_FreeValue(ctx, ab);
-    return result;
-}
+/* ── Shared helpers (cached Uint8Array constructor) ─────────── */
+#include "js_utils.h"
 
 /* ── native.crypto.generateMnemonic(wordCount) ─────────────── */
 

@@ -26,47 +26,12 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* ── Helpers (same as bridge_crypto.c) ─────────────────────── */
+/* ── Shared helpers (cached Uint8Array constructor) ─────────── */
+#include "js_utils.h"
 
-static uint8_t *js_enc_get_uint8array(JSContext *ctx, JSValueConst val,
-                                        size_t *out_len) {
-    size_t len = 0;
-    uint8_t *buf = JS_GetArrayBuffer(ctx, &len, val);
-    if (buf) { *out_len = len; return buf; }
-
-    JSValue buffer = JS_GetPropertyStr(ctx, val, "buffer");
-    if (JS_IsException(buffer)) { *out_len = 0; return NULL; }
-
-    buf = JS_GetArrayBuffer(ctx, &len, buffer);
-    if (buf) {
-        JSValue offset_val = JS_GetPropertyStr(ctx, val, "byteOffset");
-        JSValue length_val = JS_GetPropertyStr(ctx, val, "byteLength");
-        int32_t offset = 0, length = (int32_t)len;
-        JS_ToInt32(ctx, &offset, offset_val);
-        JS_ToInt32(ctx, &length, length_val);
-        JS_FreeValue(ctx, offset_val);
-        JS_FreeValue(ctx, length_val);
-        buf = buf + offset;
-        *out_len = (size_t)length;
-    } else {
-        *out_len = 0;
-    }
-    JS_FreeValue(ctx, buffer);
-    return buf;
-}
-
-static JSValue js_enc_new_uint8array(JSContext *ctx, const uint8_t *data,
-                                       size_t len) {
-    /* Create a proper Uint8Array (not raw ArrayBuffer) so JS can use .length */
-    JSValue ab = JS_NewArrayBufferCopy(ctx, data, len);
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue uint8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
-    JSValue result = JS_CallConstructor(ctx, uint8_ctor, 1, &ab);
-    JS_FreeValue(ctx, uint8_ctor);
-    JS_FreeValue(ctx, global);
-    JS_FreeValue(ctx, ab);
-    return result;
-}
+/* Aliases so existing code doesn't need renaming */
+#define js_enc_get_uint8array js_get_uint8array
+#define js_enc_new_uint8array js_new_uint8array
 
 /* ── Hex ───────────────────────────────────────────────────── */
 
