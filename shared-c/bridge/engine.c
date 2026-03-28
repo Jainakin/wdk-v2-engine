@@ -31,6 +31,9 @@
 extern void wdk_register_crypto_bridge(JSContext *ctx);
 extern void wdk_register_encoding_bridge(JSContext *ctx);
 
+/* Net bridge pump — resolves completed async fetches on the JS thread */
+extern void wdk_net_pump(JSContext *ctx);
+
 /* --------------------------------------------------------------------------
  * Engine structure
  * -------------------------------------------------------------------------- */
@@ -298,6 +301,9 @@ int wdk_engine_pump(WDKEngine *engine)
     if (!engine)
         return -1;
 
+    /* Process completed async fetch requests first */
+    wdk_net_pump(engine->ctx);
+
     JSContext *ctx_out;
     int jobs_executed = 0;
 
@@ -341,6 +347,74 @@ void wdk_engine_destroy(WDKEngine *engine)
     }
 
     free(engine);
+}
+
+/* --------------------------------------------------------------------------
+ * Get JSContext from engine
+ * -------------------------------------------------------------------------- */
+
+JSContext *wdk_engine_get_context(WDKEngine *engine)
+{
+    return engine ? engine->ctx : NULL;
+}
+
+/* --------------------------------------------------------------------------
+ * Evaluate raw JavaScript source
+ * -------------------------------------------------------------------------- */
+
+int wdk_engine_eval(WDKEngine *engine, const char *js_source)
+{
+    if (!engine || !js_source) {
+        if (engine) engine_set_error(engine, "Invalid parameters for eval");
+        return -1;
+    }
+
+    engine_clear_error(engine);
+
+    JSValue result = JS_Eval(engine->ctx, js_source, strlen(js_source),
+                              "<eval>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) {
+        engine_capture_exception(engine);
+        return -1;
+    }
+
+    JS_FreeValue(engine->ctx, result);
+
+    /* Pump any pending jobs */
+    wdk_engine_pump(engine);
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Evaluate raw JavaScript source and return string result
+ * -------------------------------------------------------------------------- */
+
+char *wdk_engine_eval_string(WDKEngine *engine, const char *js_source)
+{
+    if (!engine || !js_source) {
+        if (engine) engine_set_error(engine, "Invalid parameters for eval_string");
+        return NULL;
+    }
+
+    engine_clear_error(engine);
+
+    JSValue result = JS_Eval(engine->ctx, js_source, strlen(js_source),
+                              "<eval>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(result)) {
+        engine_capture_exception(engine);
+        return NULL;
+    }
+
+    const char *str = JS_ToCString(engine->ctx, result);
+    char *ret = str ? strdup(str) : NULL;
+    JS_FreeCString(engine->ctx, str);
+    JS_FreeValue(engine->ctx, result);
+
+    /* Pump any pending jobs */
+    wdk_engine_pump(engine);
+
+    return ret;
 }
 
 /* --------------------------------------------------------------------------

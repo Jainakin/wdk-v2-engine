@@ -84,6 +84,9 @@ add_library(wdk_engine STATIC
     bridge/key_store.c
     bridge/bridge_crypto.c
     bridge/bridge_encoding.c
+    bridge/bridge_net.c
+    bridge/bridge_storage.c
+    bridge/bridge_platform.c
 )
 target_include_directories(wdk_engine PUBLIC bridge)
 target_include_directories(wdk_engine PRIVATE

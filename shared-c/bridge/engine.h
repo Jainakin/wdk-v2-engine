@@ -89,6 +89,35 @@ void wdk_engine_destroy(WDKEngine *engine);
  */
 void wdk_free_string(char *str);
 
+/**
+ * Get the JSContext from an engine instance.
+ *
+ * Used by platform wrappers to register bridges after engine creation.
+ *
+ * @param engine  Engine instance.
+ * @return        JSContext pointer, or NULL if engine is NULL.
+ */
+struct JSContext *wdk_engine_get_context(WDKEngine *engine);
+
+/**
+ * Evaluate raw JavaScript source code.
+ *
+ * @param engine     Engine instance.
+ * @param js_source  JavaScript source code string.
+ * @return           0 on success, -1 on error.
+ */
+int wdk_engine_eval(WDKEngine *engine, const char *js_source);
+
+/**
+ * Evaluate raw JavaScript source and return the result as a string.
+ *
+ * @param engine     Engine instance.
+ * @param js_source  JavaScript source code string.
+ * @return           String result (caller must free with wdk_free_string),
+ *                   or NULL on error.
+ */
+char *wdk_engine_eval_string(WDKEngine *engine, const char *js_source);
+
 #ifdef __cplusplus
 }
 #endif
