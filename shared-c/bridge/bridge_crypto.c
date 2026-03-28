@@ -128,7 +128,15 @@ static uint8_t *js_get_uint8array(JSContext *ctx, JSValueConst val,
  */
 static JSValue js_new_uint8array(JSContext *ctx, const uint8_t *data,
                                    size_t len) {
-    return JS_NewArrayBufferCopy(ctx, data, len);
+    /* Create a proper Uint8Array (not raw ArrayBuffer) so JS can use .length */
+    JSValue ab = JS_NewArrayBufferCopy(ctx, data, len);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue uint8_ctor = JS_GetPropertyStr(ctx, global, "Uint8Array");
+    JSValue result = JS_CallConstructor(ctx, uint8_ctor, 1, &ab);
+    JS_FreeValue(ctx, uint8_ctor);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, ab);
+    return result;
 }
 
 /* ── native.crypto.generateMnemonic(wordCount) ─────────────── */
