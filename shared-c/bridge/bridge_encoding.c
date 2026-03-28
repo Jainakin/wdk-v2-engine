@@ -14,6 +14,8 @@
  *   native.encoding.bech32mDecode(str) → { hrp, data }
  *   native.encoding.base64Encode(data) → string
  *   native.encoding.base64Decode(str) → Uint8Array
+ *   native.encoding.utf8Encode(str) → Uint8Array
+ *   native.encoding.utf8Decode(data) → string
  */
 
 #include "../vendor/quickjs-ng/quickjs.h"
@@ -250,6 +252,41 @@ static JSValue js_enc_base64_decode(JSContext *ctx, JSValueConst this_val,
     return result;
 }
 
+/* ── UTF-8 ─────────────────────────────────────────────────── */
+
+/*
+ * utf8Encode(str) → Uint8Array
+ *
+ * Encodes a JS string to its UTF-8 byte representation.
+ * QuickJS strings are UTF-8 internally, so JS_ToCStringLen gives us the
+ * raw bytes directly without any conversion overhead.
+ */
+static JSValue js_enc_utf8_encode(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "string required");
+    size_t len;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str) return JS_EXCEPTION;
+    JSValue result = js_enc_new_uint8array(ctx, (const uint8_t *)str, len);
+    JS_FreeCString(ctx, str);
+    return result;
+}
+
+/*
+ * utf8Decode(data) → string
+ *
+ * Decodes a Uint8Array of UTF-8 bytes back to a JS string.
+ * JS_NewStringLen interprets the bytes as UTF-8 (QuickJS's native encoding).
+ */
+static JSValue js_enc_utf8_decode(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Uint8Array required");
+    size_t len;
+    uint8_t *data = js_enc_get_uint8array(ctx, argv[0], &len);
+    if (!data && len > 0) return JS_ThrowTypeError(ctx, "data must be Uint8Array");
+    return JS_NewStringLen(ctx, (const char *)data, len);
+}
+
 /* ── Registration ──────────────────────────────────────────── */
 
 void wdk_register_encoding_bridge(JSContext *ctx) {
@@ -287,6 +324,10 @@ void wdk_register_encoding_bridge(JSContext *ctx) {
         JS_NewCFunction(ctx, js_enc_base64_encode, "base64Encode", 1));
     JS_SetPropertyStr(ctx, encoding, "base64Decode",
         JS_NewCFunction(ctx, js_enc_base64_decode, "base64Decode", 1));
+    JS_SetPropertyStr(ctx, encoding, "utf8Encode",
+        JS_NewCFunction(ctx, js_enc_utf8_encode, "utf8Encode", 1));
+    JS_SetPropertyStr(ctx, encoding, "utf8Decode",
+        JS_NewCFunction(ctx, js_enc_utf8_decode, "utf8Decode", 1));
 
     JS_SetPropertyStr(ctx, native_obj, "encoding", encoding);
 

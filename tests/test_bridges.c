@@ -196,7 +196,24 @@ int main(void) {
         }
     }
 
-    /* Test 8: Full BTC address derivation through JS */
+    /* Test 8: utf8Encode — ASCII string → hex bytes */
+    TEST("Encoding: utf8Encode('hello') → 68656c6c6f");
+    result = wdk_engine_eval_string(engine,
+        "native.encoding.hexEncode(native.encoding.utf8Encode('hello'))");
+    if (result && strcmp(result, "68656c6c6f") == 0) { PASS(); }
+    else { FAIL(result ? result : wdk_engine_get_error(engine)); }
+    if (result) wdk_free_string(result);
+
+    /* Test 9: utf8Decode — bytes back to string */
+    TEST("Encoding: utf8Decode(utf8Encode(str)) roundtrip");
+    result = wdk_engine_eval_string(engine,
+        "native.encoding.utf8Decode(native.encoding.utf8Encode('WDK v2 \xc3\xa9\xc3\xa0'))");
+    /* \xc3\xa9 = é, \xc3\xa0 = à in UTF-8 */
+    if (result && strcmp(result, "WDK v2 \xc3\xa9\xc3\xa0") == 0) { PASS(); }
+    else { FAIL(result ? result : wdk_engine_get_error(engine)); }
+    if (result) wdk_free_string(result);
+
+    /* Test 10: Full BTC address derivation through JS */
     TEST("Full: BTC address via JS eval (known mnemonic)");
     result = wdk_engine_eval_string(engine,
         "(() => {"

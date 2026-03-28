@@ -130,4 +130,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL CMAKE_HOST_SYSTEM_NAME)
         ed25519
     )
     target_compile_options(wdk_test_runner PRIVATE -Wno-unused-parameter)
+
+    # Bridge integration tests (require full engine + QuickJS)
+    add_executable(test_bridges
+        ../tests/test_bridges.c
+    )
+    target_include_directories(test_bridges PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        bridge
+        hashing
+        encoding
+        bip
+        vendor/secp256k1/include
+        vendor/ed25519
+    )
+    target_link_libraries(test_bridges PRIVATE wdk_engine)
+    target_compile_options(test_bridges PRIVATE -Wno-unused-parameter)
 endif()
