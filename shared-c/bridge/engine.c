@@ -34,6 +34,9 @@ extern void wdk_register_encoding_bridge(JSContext *ctx);
 /* Net bridge pump — resolves completed async fetches on the JS thread */
 extern void wdk_net_pump(JSContext *ctx);
 
+/* Returns non-zero if there are in-flight fetch requests pending */
+extern int wdk_net_has_pending(void);
+
 /* --------------------------------------------------------------------------
  * Engine structure
  * -------------------------------------------------------------------------- */
@@ -131,9 +134,13 @@ WDKEngine *wdk_engine_create(void)
     /* Initialize key store */
     wdk_key_store_init();
 
-    /* Register native bridge functions */
-    wdk_register_crypto_bridge(engine->ctx);
-    wdk_register_encoding_bridge(engine->ctx);
+    /* NOTE: Bridge registration is intentionally NOT done here.
+     * All six bridges (crypto, encoding, platform, storage, net) are
+     * registered together by the platform wrapper (Swift/Kotlin) in its
+     * initialize() call, before any JS is evaluated.
+     * This ensures all of native.* is available when the bundle runs,
+     * and that provider structs (platform/storage/net) are heap-allocated
+     * with lifetimes the platform wrapper controls. */
 
     return engine;
 }
@@ -176,7 +183,109 @@ int wdk_engine_load_bytecode(WDKEngine *engine, const uint8_t *buf, size_t len)
 }
 
 /* --------------------------------------------------------------------------
+ * Internal: pump the event loop until __wdk_done is set or timeout.
+ *
+ * Used by wdk_engine_call to await async (Promise-returning) JS functions.
+ * Returns 0 on success, -1 if a job threw an exception or timeout.
+ *
+ * Key design: when JS_ExecutePendingJob returns 0 (no pending JS jobs) but
+ * there are still in-flight network requests (wdk_net_has_pending()), we
+ * must keep looping so wdk_net_pump() can resolve those fetches when they
+ * complete.  A 1 ms sleep avoids busy-waiting while yielding the thread.
+ * -------------------------------------------------------------------------- */
+
+#ifdef _WIN32
+#include <windows.h>
+#define wdk_sleep_ms(ms) Sleep(ms)
+#else
+#include <unistd.h>
+#define wdk_sleep_ms(ms) usleep((ms) * 1000)
+#endif
+
+/* Timeout for async calls: 30 seconds */
+#define WDK_ASYNC_TIMEOUT_MS 30000
+
+static int engine_pump_until_done(WDKEngine *engine)
+{
+    JSContext *ctx = engine->ctx;
+    int elapsed_ms = 0;
+
+    for (int i = 0; i < WDK_ENGINE_MAX_JOBS; i++) {
+        /* Check globalThis.__wdk_done */
+        JSValue g = JS_GetGlobalObject(ctx);
+        JSValue done_val = JS_GetPropertyStr(ctx, g, "__wdk_done");
+        JS_FreeValue(ctx, g);
+        int done = JS_ToBool(ctx, done_val);
+        JS_FreeValue(ctx, done_val);
+        if (done)
+            return 0;
+
+        /* Process any completed native async operations (e.g., network) */
+        wdk_net_pump(ctx);
+
+        /* Run one pending microtask/job */
+        JSContext *ctx_out;
+        int rc = JS_ExecutePendingJob(engine->rt, &ctx_out);
+
+        if (rc < 0) {
+            /* JS job threw an exception */
+            engine_capture_exception(engine);
+            return -1;
+        }
+
+        if (rc == 0) {
+            /* No pending JS jobs right now.
+             * If there are in-flight network fetches, sleep briefly and
+             * retry — the fetch callback will set pf->completed, and the
+             * next wdk_net_pump() will resolve the Promise, creating new
+             * pending JS jobs.
+             * If there are NO pending fetches and no pending JS jobs,
+             * there is nothing to wait for — the async chain is broken
+             * or already resolved (and __wdk_done wasn't set). */
+            if (!wdk_net_has_pending()) {
+                /* Nothing async in flight — check one more time in case
+                 * the last wdk_net_pump resolved something but the
+                 * JS jobs haven't been queued yet. */
+                wdk_net_pump(ctx);
+                rc = JS_ExecutePendingJob(engine->rt, &ctx_out);
+                if (rc <= 0) {
+                    /* Truly nothing pending. __wdk_done may still be
+                     * false if the Promise resolved synchronously and
+                     * the handlers haven't run yet — this is unexpected
+                     * but return 0 to let the caller check. */
+                    return rc < 0 ? (engine_capture_exception(engine), -1) : 0;
+                }
+                /* A job appeared — continue the main loop */
+                continue;
+            }
+
+            /* Network requests in flight — yield briefly to avoid
+             * burning CPU while URLSession / OkHttp does its work. */
+            wdk_sleep_ms(1);
+            elapsed_ms += 1;
+
+            if (elapsed_ms >= WDK_ASYNC_TIMEOUT_MS) {
+                engine_set_error(engine,
+                    "async call timed out: network request did not "
+                    "complete within 30 seconds");
+                return -1;
+            }
+        }
+        /* rc > 0: a job ran, loop back to check __wdk_done */
+    }
+
+    /* Ran out of iteration budget */
+    engine_set_error(engine,
+        "async call timed out: __wdk_done not set after 10000 job iterations");
+    return -1;
+}
+
+/* --------------------------------------------------------------------------
  * Call a function on the global wdk object
+ *
+ * Handles both synchronous and async (Promise-returning) JS functions.
+ * For async functions the engine is pumped until the Promise resolves or
+ * rejects, and the resolved value is JSON-stringified and returned.
  * -------------------------------------------------------------------------- */
 
 char *wdk_engine_call(WDKEngine *engine, const char *func_name, const char *json_args)
@@ -240,10 +349,82 @@ char *wdk_engine_call(WDKEngine *engine, const char *func_name, const char *json
         return NULL;
     }
 
-    /* Pump pending jobs (in case the function kicked off async work) */
-    wdk_engine_pump(engine);
+    /* ── Async Promise support ──────────────────────────────────────────
+     * If the function returned a Promise (thenable), attach .then/.catch
+     * handlers that write the settled value to well-known globals, then
+     * pump the job queue until __wdk_done is true.  This lets C code
+     * await any async JS function without blocking threads or callbacks.
+     * ─────────────────────────────────────────────────────────────────── */
 
-    /* JSON.stringify the result */
+    JSValue then_prop = JS_GetPropertyStr(ctx, result, "then");
+    int is_promise = JS_IsFunction(ctx, then_prop);
+    JS_FreeValue(ctx, then_prop);
+
+    if (is_promise) {
+        /* Store the Promise in a global so the setup eval can reach it. */
+        JSValue g2 = JS_GetGlobalObject(ctx);
+        /* JS_SetPropertyStr takes ownership of the value — result is consumed. */
+        JS_SetPropertyStr(ctx, g2, "__wdk_promise", result);
+        JS_FreeValue(ctx, g2);
+
+        /* Attach .then/.catch handlers; reset sentinel globals. */
+        static const char setup[] =
+            "globalThis.__wdk_done=false;"
+            "globalThis.__wdk_result=undefined;"
+            "globalThis.__wdk_error=undefined;"
+            "globalThis.__wdk_promise"
+            ".then(function(v){"
+            "  globalThis.__wdk_result=v;"
+            "  globalThis.__wdk_done=true;"
+            "})"
+            ".catch(function(e){"
+            "  globalThis.__wdk_error=(e&&e.message)?e.message:String(e);"
+            "  globalThis.__wdk_done=true;"
+            "});";
+
+        JSValue sv = JS_Eval(ctx, setup, sizeof(setup) - 1,
+                             "<wdk_await>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(sv)) {
+            engine_capture_exception(engine);
+            return NULL;
+        }
+        JS_FreeValue(ctx, sv);
+
+        /* Pump until resolved/rejected. */
+        if (engine_pump_until_done(engine) < 0)
+            return NULL;  /* error already captured */
+
+        /* Collect settled result or rejection reason. */
+        JSValue g3 = JS_GetGlobalObject(ctx);
+        JSValue error_val  = JS_GetPropertyStr(ctx, g3, "__wdk_error");
+        JSValue result_val = JS_GetPropertyStr(ctx, g3, "__wdk_result");
+
+        /* Release the stored Promise so it can be GC'd. */
+        JS_SetPropertyStr(ctx, g3, "__wdk_promise", JS_UNDEFINED);
+        JS_FreeValue(ctx, g3);
+
+        if (!JS_IsUndefined(error_val)) {
+            /* Promise was rejected — propagate as a C error. */
+            const char *estr = JS_ToCString(ctx, error_val);
+            engine_set_error(engine, estr ? estr : "Promise rejected");
+            if (estr) JS_FreeCString(ctx, estr);
+            JS_FreeValue(ctx, error_val);
+            JS_FreeValue(ctx, result_val);
+            return NULL;
+        }
+
+        JS_FreeValue(ctx, error_val);
+
+        /* Use the resolved value as the result to stringify. */
+        result = result_val;  /* ownership transferred; freed below */
+
+    } else {
+        /* Synchronous result — pump any residual microtasks and proceed. */
+        wdk_engine_pump(engine);
+    }
+
+    /* ── JSON.stringify the result ──────────────────────────────────── */
+
     JSValue json_global = JS_GetGlobalObject(ctx);
     JSValue json_obj = JS_GetPropertyStr(ctx, json_global, "JSON");
     JSValue stringify_func = JS_GetPropertyStr(ctx, json_obj, "stringify");

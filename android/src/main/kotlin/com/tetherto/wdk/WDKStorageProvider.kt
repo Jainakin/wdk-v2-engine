@@ -2,6 +2,7 @@ package com.tetherto.wdk
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
@@ -76,6 +77,29 @@ class WDKStorageProvider(context: Context) {
      */
     fun secureDelete(key: String): Boolean {
         return securePrefs.edit().remove(key).commit()
+    }
+
+    /**
+     * Store binary bytes in encrypted storage (base64-encoded internally).
+     * Called from the JNI bridge when the C engine writes binary key material.
+     */
+    fun secureSetBytes(key: String, value: ByteArray): Boolean {
+        val encoded = Base64.encodeToString(value, Base64.NO_WRAP)
+        return securePrefs.edit().putString(key, encoded).commit()
+    }
+
+    /**
+     * Retrieve binary bytes from encrypted storage.
+     * Returns null if the key does not exist.
+     * Called from the JNI bridge when the C engine reads binary key material.
+     */
+    fun secureGetBytes(key: String): ByteArray? {
+        val encoded = securePrefs.getString(key, null) ?: return null
+        return try {
+            Base64.decode(encoded, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     // ── Regular storage ─────────────────────────────────────────

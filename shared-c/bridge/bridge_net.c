@@ -19,6 +19,16 @@
 static const WDKNetProvider *s_net_provider = NULL;
 
 /* ── Pending fetch queue (thread-safe via atomics) ───────────── */
+/*
+ * Design: each PendingFetch is heap-allocated so the pointer given to the
+ * platform callback is stable for its lifetime.  The pointer array
+ * (pending_fetch_ptrs) lives only on the JS thread, so pending_count and
+ * the pointer slots need no synchronisation.  The only cross-thread state
+ * is the per-entry `completed` atomic flag — written by the platform thread
+ * with release semantics, read by the JS thread with acquire semantics,
+ * which guarantees that all non-atomic fields written before the flag are
+ * visible after the flag is observed as set.
+ */
 
 typedef struct {
     JSValue resolve;
@@ -33,7 +43,10 @@ typedef struct {
 } PendingFetch;
 
 #define MAX_PENDING_FETCHES 64
-static PendingFetch pending_fetches[MAX_PENDING_FETCHES];
+/* Array of POINTERS — each PendingFetch is heap-allocated so the pointer
+ * passed to the platform callback remains valid even if this array is
+ * compacted.  Accessed only from the JS engine thread. */
+static PendingFetch *pending_fetch_ptrs[MAX_PENDING_FETCHES];
 static int pending_count = 0;
 
 /* ── Helpers ─────────────────────────────────────────────────── */
@@ -216,13 +229,23 @@ static JSValue js_net_fetch(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     }
 
-    /* Set up pending fetch slot */
-    PendingFetch *pf = &pending_fetches[pending_count];
-    memset(pf, 0, sizeof(PendingFetch));
+    /* Allocate a stable heap slot — the pointer is given directly to the
+     * platform callback, so it must not be invalidated by queue compaction. */
+    PendingFetch *pf = (PendingFetch *)calloc(1, sizeof(PendingFetch));
+    if (!pf) {
+        JS_FreeValue(ctx, promise);
+        JS_FreeValue(ctx, resolving_funcs[0]);
+        JS_FreeValue(ctx, resolving_funcs[1]);
+        JS_FreeCString(ctx, url);
+        if (method_str) JS_FreeCString(ctx, method_str);
+        if (headers_json) JS_FreeCString(ctx, headers_json);
+        return JS_ThrowInternalError(ctx, "Out of memory for fetch slot");
+    }
     pf->resolve = JS_DupValue(ctx, resolving_funcs[0]);
-    pf->reject = JS_DupValue(ctx, resolving_funcs[1]);
-    pf->ctx = ctx;
+    pf->reject  = JS_DupValue(ctx, resolving_funcs[1]);
+    pf->ctx     = ctx;
     atomic_store(&pf->completed, 0);
+    pending_fetch_ptrs[pending_count] = pf;
     pending_count++;
 
     JS_FreeValue(ctx, resolving_funcs[0]);
@@ -246,9 +269,10 @@ static JSValue js_net_fetch(JSContext *ctx, JSValueConst this_val,
 void wdk_net_pump(JSContext *ctx) {
     int i = 0;
     while (i < pending_count) {
-        PendingFetch *pf = &pending_fetches[i];
+        PendingFetch *pf = pending_fetch_ptrs[i];
 
-        /* Check with acquire semantics */
+        /* Check with acquire semantics — also guarantees all non-atomic
+         * fields written before the release store are now visible. */
         if (!atomic_load_explicit(&pf->completed, memory_order_acquire)) {
             i++;
             continue;
@@ -284,20 +308,29 @@ void wdk_net_pump(JSContext *ctx) {
             JS_FreeValue(ctx, response);
         }
 
-        /* Clean up */
+        /* Free heap-allocated entry and its dynamic fields */
         JS_FreeValue(ctx, pf->resolve);
         JS_FreeValue(ctx, pf->reject);
         free(pf->headers_json);
         free(pf->body);
         free(pf->error);
+        free(pf);  /* release the stable heap allocation */
 
-        /* Compact: move last entry into this slot */
+        /* Compact: move last POINTER into this slot — safe because the
+         * platform callback holds a direct pointer to the PendingFetch
+         * heap object, not an index or a pointer-to-slot. */
         pending_count--;
         if (i < pending_count) {
-            pending_fetches[i] = pending_fetches[pending_count];
+            pending_fetch_ptrs[i] = pending_fetch_ptrs[pending_count];
         }
-        /* Don't increment i -- re-check same slot */
+        /* Don't increment i — re-check this slot (now holds a different entry) */
     }
+}
+
+/* ── Query: are there any in-flight fetches? ─────────────────── */
+
+int wdk_net_has_pending(void) {
+    return pending_count > 0;
 }
 
 /* ── Registration ────────────────────────────────────────────── */

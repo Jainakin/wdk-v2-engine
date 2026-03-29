@@ -17,13 +17,15 @@ typedef struct JSContext JSContext;
 
 /*
  * Register native.crypto.* functions into the JS context.
- * Called during engine creation.
+ * Must be called after wdk_engine_create(), before wdk_engine_eval().
+ * No platform provider required — pure C implementation.
  */
 void wdk_register_crypto_bridge(JSContext *ctx);
 
 /*
  * Register native.encoding.* functions into the JS context.
- * Called during engine creation.
+ * Must be called after wdk_engine_create(), before wdk_engine_eval().
+ * No platform provider required — pure C implementation.
  */
 void wdk_register_encoding_bridge(JSContext *ctx);
 

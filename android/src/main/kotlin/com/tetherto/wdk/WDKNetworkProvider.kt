@@ -120,6 +120,66 @@ class WDKNetworkProvider {
     }
 
     /**
+     * JNI-callable fetch bridge.
+     *
+     * Called by the C JNI bridge (jni_net_fetch) when the JS bundle calls
+     * native.net.fetch(). When the response arrives, calls
+     * nativeCompleteNetRequest to deliver the result back to the C callback.
+     *
+     * @param url          Request URL.
+     * @param method       HTTP method string.
+     * @param headersJson  JSON object string of request headers (e.g. `{"Content-Type":"text/plain"}`).
+     * @param body         Optional request body bytes.
+     * @param timeoutMs    Per-request timeout in milliseconds (0 = use default 30s).
+     * @param callbackPtr  JNIPendingNet* cast to Long — passed to nativeCompleteNetRequest.
+     */
+    fun fetchJni(
+        url: String,
+        method: String,
+        headersJson: String,
+        body: ByteArray?,
+        timeoutMs: Int,
+        callbackPtr: Long
+    ) {
+        // Parse headersJson into a Map<String, String>
+        val headersMap: Map<String, String> = try {
+            val obj = org.json.JSONObject(headersJson)
+            val map = mutableMapOf<String, String>()
+            for (key in obj.keys()) {
+                map[key] = obj.getString(key)
+            }
+            map
+        } catch (_: Exception) {
+            emptyMap()
+        }
+
+        val timeoutSec = if (timeoutMs > 0) timeoutMs / 1000 else 30
+
+        fetch(url, method, headersMap, body, timeoutSec) { statusCode, responseHeaders, responseBody, error ->
+            // Serialize response headers back to JSON for the C callback
+            val respHeadersJson = try {
+                val obj = org.json.JSONObject(responseHeaders as Map<*, *>)
+                obj.toString()
+            } catch (_: Exception) {
+                "{}"
+            }
+            nativeCompleteNetRequest(callbackPtr, statusCode, respHeadersJson, responseBody, error)
+        }
+    }
+
+    /**
+     * Called by fetchJni to deliver the HTTP result back to the C WDKFetchCallback.
+     * Implemented as a JNI function in wdk_jni.c.
+     */
+    private external fun nativeCompleteNetRequest(
+        callbackPtr: Long,
+        status: Int,
+        headersJson: String?,
+        body: ByteArray?,
+        error: String?
+    )
+
+    /**
      * Cancel all pending requests.
      */
     fun cancelAll() {

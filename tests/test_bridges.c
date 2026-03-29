@@ -86,6 +86,14 @@ int main(void) {
     TEST("Engine: create and eval basic JS");
     WDKEngine *engine = wdk_engine_create();
     if (!engine) { FAIL("create failed"); return 1; }
+
+    /* Register pure-C bridges explicitly — wdk_engine_create() no longer
+     * does this automatically. Platform wrappers (Swift/Kotlin) do it in
+     * their initialize() before eval. C tests must do it manually. */
+    JSContext *ctx = wdk_engine_get_context(engine);
+    wdk_register_crypto_bridge(ctx);
+    wdk_register_encoding_bridge(ctx);
+
     int ret = wdk_engine_eval(engine, "var x = 1 + 2;");
     if (ret == 0) { PASS(); } else { FAIL(wdk_engine_get_error(engine)); }
 
@@ -168,8 +176,26 @@ int main(void) {
     /* Test 7: Load JS bundle and call wdk.createWallet */
     TEST("Full: load wdk-bundle.js + call wdk.createWallet()");
     {
-        /* Try to load the JS bundle */
-        const char *bundle_path = "/Users/hardik/Desktop/wdk-v2/working/wdk-v2-core/dist/wdk-bundle.js";
+        /* Try to load the JS bundle.
+         * WDK_BUNDLE_PATH env var overrides the default path relative to this file. */
+        const char *bundle_path = getenv("WDK_BUNDLE_PATH");
+        if (!bundle_path) {
+            /* Default: relative to this test file's directory */
+            bundle_path = __FILE__;
+            /* Strip filename from __FILE__ and append relative path */
+            static char resolved_path[1024];
+            const char *last_slash = strrchr(bundle_path, '/');
+            if (last_slash) {
+                size_t dir_len = (size_t)(last_slash - bundle_path);
+                snprintf(resolved_path, sizeof(resolved_path),
+                         "%.*s/../../wdk-v2-core/dist/wdk-bundle.js",
+                         (int)dir_len, bundle_path);
+            } else {
+                snprintf(resolved_path, sizeof(resolved_path),
+                         "../../wdk-v2-core/dist/wdk-bundle.js");
+            }
+            bundle_path = resolved_path;
+        }
         FILE *f = fopen(bundle_path, "rb");
         if (f) {
             fseek(f, 0, SEEK_END);
@@ -245,6 +271,54 @@ int main(void) {
         FAIL(msg);
     }
     if (result) wdk_free_string(result);
+
+    /* Test 11: Async dispatch — wdk_engine_call awaits Promise from async dispatch() */
+    /* This test exercises the Group-C fix: wdk_engine_call must detect a Promise
+     * result, attach .then/.catch handlers, pump until resolved, and return the
+     * actual address string — not "{}" or "undefined". */
+    TEST("Async: wdk_engine_call getAddress resolves Promise → bc1q...");
+    {
+        /* The bundle was already eval'd in test 7. Use the known mnemonic so the
+         * address is deterministic. */
+        static const char *abandon_mnemonic =
+            "abandon abandon abandon abandon abandon abandon "
+            "abandon abandon abandon abandon abandon about";
+
+        /* createWallet with the known mnemonic is not possible via the JS API
+         * (createWallet generates its own mnemonic). Use unlockWallet directly
+         * with the known mnemonic to put engine2 into the "ready" state. */
+        char unlock_args[256];
+        snprintf(unlock_args, sizeof(unlock_args),
+                 "{\"mnemonic\":\"%s\"}", abandon_mnemonic);
+
+        char *unlock_result = wdk_engine_call(engine, "unlockWallet", unlock_args);
+        if (!unlock_result) {
+            FAIL(wdk_engine_get_error(engine) ? wdk_engine_get_error(engine) : "unlockWallet failed");
+            goto test11_done;
+        }
+        wdk_free_string(unlock_result);
+
+        /* Now call getAddress — this goes through async dispatch() */
+        char *addr = wdk_engine_call(engine, "getAddress", "{\"chain\":\"btc\"}");
+        if (!addr) {
+            FAIL(wdk_engine_get_error(engine) ? wdk_engine_get_error(engine) : "getAddress returned NULL");
+            goto test11_done;
+        }
+
+        /* JSON.stringify wraps the string in quotes: "\"bc1q...\"" */
+        /* After JSON.parse on the TS side it becomes the plain address.
+         * In the C test, addr is the raw JSON-stringified value. */
+        int ok = (addr[0] == '"' && strstr(addr, "bc1q") != NULL);
+        if (ok) {
+            PASS();
+        } else {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "got '%s'", addr);
+            FAIL(msg);
+        }
+        wdk_free_string(addr);
+    }
+    test11_done:;
 
     /* Cleanup */
     wdk_engine_destroy(engine);

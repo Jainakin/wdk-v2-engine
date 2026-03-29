@@ -52,7 +52,7 @@ class WDKEngine {
     private external fun nativeCreate(): Long
     private external fun nativeLoadBytecode(ptr: Long, bytecode: ByteArray): Int
     private external fun nativeCall(ptr: Long, method: String, jsonArgs: String): String?
-    private external fun nativeEval(ptr: Long, code: String): String?
+    private external fun nativeEval(ptr: Long, code: String): Int
     private external fun nativePump(ptr: Long): Int
     private external fun nativeDestroy(ptr: Long)
     private external fun nativeGetError(ptr: Long): String?
@@ -118,20 +118,22 @@ class WDKEngine {
     }
 
     /**
-     * Evaluate raw JavaScript code in the engine context.
+     * Evaluate raw JavaScript source code in the engine context.
      *
-     * Intended primarily for testing and debugging. The code is passed to the
-     * engine's `__eval` bridge function.
+     * Uses wdk_engine_eval (JS_Eval) directly — does NOT require globalThis.wdk
+     * to exist. Used to load the JS bundle before any wdk.* calls are possible.
      *
      * @param code JavaScript source code.
-     * @return JSON-stringified result, or null if the evaluation returned undefined.
      * @throws WDKException if evaluation fails.
      */
-    suspend fun eval(code: String): String? {
-        return withNative("eval") { ptr ->
+    suspend fun eval(code: String) {
+        withNative("eval") { ptr ->
             val result = nativeEval(ptr, code)
             nativePump(ptr)
-            result
+            if (result != 0) {
+                val error = nativeGetError(ptr) ?: "JS eval failed"
+                throw WDKException("Engine eval failed: $error")
+            }
         }
     }
 

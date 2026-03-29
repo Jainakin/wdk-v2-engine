@@ -70,8 +70,22 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("\n=== WDK v2 — Bitcoin Integration Tests ===\n\n");
 
-    const char *bundle_path = argc > 1 ? argv[1] :
-        "/Users/hardik/Desktop/wdk-v2/working/wdk-v2-core/dist/wdk-bundle.js";
+    /* Bundle path: argv[1] → WDK_BUNDLE_PATH env var → path relative to __FILE__ */
+    const char *bundle_path = argc > 1 ? argv[1] : getenv("WDK_BUNDLE_PATH");
+    static char resolved_path[1024];
+    if (!bundle_path) {
+        const char *src = __FILE__;
+        const char *last_slash = strrchr(src, '/');
+        if (last_slash) {
+            snprintf(resolved_path, sizeof(resolved_path),
+                     "%.*s/../../wdk-v2-core/dist/wdk-bundle.js",
+                     (int)(last_slash - src), src);
+        } else {
+            snprintf(resolved_path, sizeof(resolved_path),
+                     "../../wdk-v2-core/dist/wdk-bundle.js");
+        }
+        bundle_path = resolved_path;
+    }
 
     /* Setup QuickJS */
     JSRuntime *rt = JS_NewRuntime();

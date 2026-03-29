@@ -153,19 +153,22 @@ static JSValue js_crypto_mnemonic_to_seed(JSContext *ctx,
     if (!mnemonic) return JS_EXCEPTION;
 
     const char *passphrase = "";
+    int passphrase_allocated = 0; /* track whether passphrase was JS-allocated */
     if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
         passphrase = JS_ToCString(ctx, argv[1]);
         if (!passphrase) {
             JS_FreeCString(ctx, mnemonic);
             return JS_EXCEPTION;
         }
+        passphrase_allocated = 1;
     }
 
     uint8_t seed[64];
     int ret = wdk_bip39_mnemonic_to_seed(mnemonic, passphrase, seed);
 
     JS_FreeCString(ctx, mnemonic);
-    if (passphrase[0] != '\0') JS_FreeCString(ctx, passphrase);
+    /* Free passphrase only if it was JS-allocated — avoids freeing the static "" */
+    if (passphrase_allocated) JS_FreeCString(ctx, passphrase);
 
     if (ret != 0) {
         return JS_ThrowInternalError(ctx, "Failed to derive seed");
@@ -230,19 +233,18 @@ static JSValue js_crypto_derive_key(JSContext *ctx,
         JS_FreeCString(ctx, path);
         return JS_ThrowInternalError(ctx, "Failed to derive key at path");
     }
-    JS_FreeCString(ctx, path);
+
+    /* Determine curve from path BEFORE freeing — strstr(path, ...) must happen while path is valid */
+    int derived_curve = WDK_KEY_CURVE_SECP256K1; /* default */
+    if (strstr(path, "/501'") || strstr(path, "/607'")) {
+        derived_curve = WDK_KEY_CURVE_ED25519;
+    }
+    JS_FreeCString(ctx, path);  /* safe to free now — curve check is done */
 
     /* Store derived private key + chain code (64 bytes total) in key store */
     uint8_t combined[64];
     memcpy(combined, derived.private_key, 32);
     memcpy(combined + 32, derived.chain_code, 32);
-
-    /* Determine curve from path — paths starting with m/44'/501' or m/44'/607' are Ed25519 */
-    int derived_curve = WDK_KEY_CURVE_SECP256K1; /* default */
-    /* Simple heuristic: check coin type in path */
-    if (strstr(path, "/501'") || strstr(path, "/607'")) {
-        derived_curve = WDK_KEY_CURVE_ED25519;
-    }
 
     WDKKeyHandle new_handle = wdk_key_store_add(combined, 64, derived_curve);
 
