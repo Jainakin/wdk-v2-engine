@@ -441,6 +441,15 @@ char *wdk_engine_call(WDKEngine *engine, const char *func_name, const char *json
         return NULL;
     }
 
+    /* JSON.stringify(undefined) returns JS_UNDEFINED, not a string.
+     * Return "null" so callers always get valid JSON. */
+    if (JS_IsUndefined(json_result)) {
+        JS_FreeValue(ctx, json_result);
+        char *out = (char *)malloc(5);
+        if (out) memcpy(out, "null", 5);
+        return out;
+    }
+
     /* Convert to C string */
     const char *str = JS_ToCString(ctx, json_result);
     JS_FreeValue(ctx, json_result);
