@@ -191,6 +191,14 @@ static JSValue js_enc_bech32_decode_impl(JSContext *ctx, int argc,
 
     if (ret != 0) return JS_ThrowTypeError(ctx, "Invalid bech32 string");
 
+    /* Reject encoding mismatch: bech32Decode must get bech32, bech32mDecode must get bech32m */
+    if (is_bech32m != expected_bech32m) {
+        return JS_ThrowTypeError(ctx,
+            expected_bech32m
+                ? "Expected bech32m encoding but got bech32"
+                : "Expected bech32 encoding but got bech32m");
+    }
+
     /* Return { hrp, data } */
     JSValue result = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, result, "hrp", JS_NewString(ctx, hrp));
