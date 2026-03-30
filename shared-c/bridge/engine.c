@@ -34,8 +34,14 @@ extern void wdk_register_encoding_bridge(JSContext *ctx);
 /* Net bridge pump — resolves completed async fetches on the JS thread */
 extern void wdk_net_pump(JSContext *ctx);
 
+/* WebSocket bridge pump — delivers queued WS messages on the JS thread */
+extern void wdk_ws_pump(JSContext *ctx);
+
 /* Returns non-zero if there are in-flight fetch requests pending */
 extern int wdk_net_has_pending(void);
+
+/* Returns non-zero if there are active WebSocket connections */
+extern int wdk_ws_has_pending(void);
 
 /* --------------------------------------------------------------------------
  * Engine structure
@@ -222,6 +228,7 @@ static int engine_pump_until_done(WDKEngine *engine)
 
         /* Process any completed native async operations (e.g., network) */
         wdk_net_pump(ctx);
+        wdk_ws_pump(ctx);
 
         /* Run one pending microtask/job */
         JSContext *ctx_out;
@@ -242,11 +249,12 @@ static int engine_pump_until_done(WDKEngine *engine)
              * If there are NO pending fetches and no pending JS jobs,
              * there is nothing to wait for — the async chain is broken
              * or already resolved (and __wdk_done wasn't set). */
-            if (!wdk_net_has_pending()) {
+            if (!wdk_net_has_pending() && !wdk_ws_has_pending()) {
                 /* Nothing async in flight — check one more time in case
                  * the last wdk_net_pump resolved something but the
                  * JS jobs haven't been queued yet. */
                 wdk_net_pump(ctx);
+        wdk_ws_pump(ctx);
                 rc = JS_ExecutePendingJob(engine->rt, &ctx_out);
                 if (rc <= 0) {
                     /* Truly nothing pending. __wdk_done may still be

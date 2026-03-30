@@ -46,7 +46,7 @@ typedef void (*WDKPlatformFetchFn)(const char *url, const char *method,
                                     WDKFetchCallback callback);
 
 /*
- * WebSocket callbacks
+ * WebSocket callbacks and types
  */
 typedef void (*WDKWSMessageCallback)(void *context, const char *message,
                                       const char *error);
@@ -55,5 +55,11 @@ typedef void *(*WDKPlatformWSConnectFn)(const char *url, void *context,
                                          WDKWSMessageCallback on_message);
 typedef void (*WDKPlatformWSSendFn)(void *ws_handle, const char *data);
 typedef void (*WDKPlatformWSCloseFn)(void *ws_handle);
+
+/* Query: are there any active WebSocket connections? */
+int wdk_ws_has_pending(void);
+
+/* Pump: deliver queued WebSocket messages on the JS thread */
+void wdk_ws_pump(JSContext *ctx);
 
 #endif /* WDK_BRIDGE_NET_H */

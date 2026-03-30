@@ -333,6 +333,292 @@ int wdk_net_has_pending(void) {
     return pending_count > 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * WebSocket Bridge
+ *
+ * Unlike HTTP (one-shot request→response), WebSocket connections
+ * are long-lived and receive multiple messages. We use:
+ *   - PendingWSConnection: per-connection state (heap-allocated)
+ *   - PendingWSMessage: per-message ring buffer (SPSC lock-free)
+ *
+ * Platform thread enqueues messages; JS thread dequeues during pump.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* ── WebSocket connection state ──────────────────────────────── */
+
+typedef struct {
+    int32_t handle_id;
+    void *platform_handle;        /* opaque, from ws_connect */
+    JSValue on_message_cb;        /* JS callback, DupValue'd */
+    JSValue on_close_cb;          /* JS callback, DupValue'd */
+    JSContext *ctx;
+    atomic_int state;             /* 0=connecting, 1=open, 2=closed */
+} PendingWSConnection;
+
+#define MAX_WS_CONNECTIONS 16
+static PendingWSConnection *ws_connections[MAX_WS_CONNECTIONS];
+static int ws_count = 0;
+static int32_t ws_next_handle = 1;
+
+/* ── WebSocket message ring buffer ───────────────────────────── */
+
+typedef struct {
+    int32_t connection_handle;
+    char *message;                /* heap-allocated, or NULL on error */
+    char *error;                  /* heap-allocated, or NULL on success */
+} PendingWSMessage;
+
+#define MAX_WS_MESSAGES 256
+static PendingWSMessage ws_messages[MAX_WS_MESSAGES];
+static atomic_uint ws_write_head = 0;
+static atomic_uint ws_read_head = 0;
+
+/* ── Find connection by handle ───────────────────────────────── */
+
+static PendingWSConnection *ws_find(int32_t handle) {
+    for (int i = 0; i < ws_count; i++) {
+        if (ws_connections[i] && ws_connections[i]->handle_id == handle)
+            return ws_connections[i];
+    }
+    return NULL;
+}
+
+/* ── Platform callback: enqueue message to ring buffer ────────── */
+
+static void ws_message_callback(void *context, const char *message,
+                                 const char *error) {
+    PendingWSConnection *conn = (PendingWSConnection *)context;
+
+    unsigned int wh = atomic_load_explicit(&ws_write_head, memory_order_relaxed);
+    unsigned int rh = atomic_load_explicit(&ws_read_head, memory_order_acquire);
+    unsigned int next = (wh + 1) % MAX_WS_MESSAGES;
+
+    if (next == rh) {
+        /* Ring buffer full — drop message (should be rare) */
+        return;
+    }
+
+    ws_messages[wh].connection_handle = conn->handle_id;
+    ws_messages[wh].message = message ? strdup(message) : NULL;
+    ws_messages[wh].error = error ? strdup(error) : NULL;
+
+    atomic_store_explicit(&ws_write_head, next, memory_order_release);
+}
+
+/* ── native.net.wsConnect(url) → handle (int) ────────────────── */
+
+static JSValue js_net_ws_connect(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!s_net_provider || !s_net_provider->ws_connect) {
+        return JS_ThrowInternalError(ctx, "WebSocket not supported on this platform");
+    }
+    if (argc < 1) return JS_ThrowTypeError(ctx, "url required");
+    if (ws_count >= MAX_WS_CONNECTIONS) {
+        return JS_ThrowInternalError(ctx, "Too many WebSocket connections");
+    }
+
+    const char *url = JS_ToCString(ctx, argv[0]);
+    if (!url) return JS_EXCEPTION;
+
+    PendingWSConnection *conn = (PendingWSConnection *)calloc(1, sizeof(PendingWSConnection));
+    if (!conn) {
+        JS_FreeCString(ctx, url);
+        return JS_ThrowInternalError(ctx, "Out of memory for WebSocket");
+    }
+
+    conn->handle_id = ws_next_handle++;
+    conn->ctx = ctx;
+    conn->on_message_cb = JS_UNDEFINED;
+    conn->on_close_cb = JS_UNDEFINED;
+    atomic_store(&conn->state, 0); /* connecting */
+
+    /* Call platform to create the WebSocket */
+    conn->platform_handle = s_net_provider->ws_connect(
+        url, conn, ws_message_callback);
+
+    JS_FreeCString(ctx, url);
+
+    if (!conn->platform_handle) {
+        free(conn);
+        return JS_ThrowInternalError(ctx, "WebSocket connect failed");
+    }
+
+    atomic_store(&conn->state, 1); /* open */
+    ws_connections[ws_count++] = conn;
+
+    return JS_NewInt32(ctx, conn->handle_id);
+}
+
+/* ── native.net.wsSend(handle, data) ─────────────────────────── */
+
+static JSValue js_net_ws_send(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!s_net_provider || !s_net_provider->ws_send) {
+        return JS_ThrowInternalError(ctx, "WebSocket not supported");
+    }
+    if (argc < 2) return JS_ThrowTypeError(ctx, "handle and data required");
+
+    int32_t handle;
+    JS_ToInt32(ctx, &handle, argv[0]);
+
+    PendingWSConnection *conn = ws_find(handle);
+    if (!conn || atomic_load(&conn->state) != 1) {
+        return JS_ThrowInternalError(ctx, "WebSocket not open");
+    }
+
+    const char *data = JS_ToCString(ctx, argv[1]);
+    if (!data) return JS_EXCEPTION;
+
+    s_net_provider->ws_send(conn->platform_handle, data);
+    JS_FreeCString(ctx, data);
+
+    return JS_UNDEFINED;
+}
+
+/* ── native.net.wsClose(handle) ──────────────────────────────── */
+
+static JSValue js_net_ws_close(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "handle required");
+
+    int32_t handle;
+    JS_ToInt32(ctx, &handle, argv[0]);
+
+    PendingWSConnection *conn = ws_find(handle);
+    if (!conn) return JS_UNDEFINED; /* already closed */
+
+    atomic_store(&conn->state, 2); /* closed */
+
+    if (s_net_provider && s_net_provider->ws_close && conn->platform_handle) {
+        s_net_provider->ws_close(conn->platform_handle);
+    }
+
+    return JS_UNDEFINED;
+}
+
+/* ── native.net.wsOnMessage(handle, callback) ────────────────── */
+
+static JSValue js_net_ws_on_message(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "handle and callback required");
+
+    int32_t handle;
+    JS_ToInt32(ctx, &handle, argv[0]);
+
+    PendingWSConnection *conn = ws_find(handle);
+    if (!conn) return JS_ThrowInternalError(ctx, "WebSocket not found");
+
+    if (!JS_IsUndefined(conn->on_message_cb)) {
+        JS_FreeValue(ctx, conn->on_message_cb);
+    }
+    conn->on_message_cb = JS_DupValue(ctx, argv[1]);
+
+    return JS_UNDEFINED;
+}
+
+/* ── native.net.wsOnClose(handle, callback) ──────────────────── */
+
+static JSValue js_net_ws_on_close(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "handle and callback required");
+
+    int32_t handle;
+    JS_ToInt32(ctx, &handle, argv[0]);
+
+    PendingWSConnection *conn = ws_find(handle);
+    if (!conn) return JS_ThrowInternalError(ctx, "WebSocket not found");
+
+    if (!JS_IsUndefined(conn->on_close_cb)) {
+        JS_FreeValue(ctx, conn->on_close_cb);
+    }
+    conn->on_close_cb = JS_DupValue(ctx, argv[1]);
+
+    return JS_UNDEFINED;
+}
+
+/* ── WebSocket pump: deliver queued messages on JS thread ─────── */
+
+void wdk_ws_pump(JSContext *ctx) {
+    unsigned int rh = atomic_load_explicit(&ws_read_head, memory_order_relaxed);
+    unsigned int wh = atomic_load_explicit(&ws_write_head, memory_order_acquire);
+
+    while (rh != wh) {
+        PendingWSMessage *msg = &ws_messages[rh];
+        PendingWSConnection *conn = ws_find(msg->connection_handle);
+
+        if (conn && !JS_IsUndefined(conn->on_message_cb)) {
+            if (msg->error) {
+                /* Error — deliver to onClose if available, else onMessage */
+                if (!JS_IsUndefined(conn->on_close_cb)) {
+                    JSValue err_str = JS_NewString(ctx, msg->error);
+                    JS_Call(ctx, conn->on_close_cb, JS_UNDEFINED, 1, &err_str);
+                    JS_FreeValue(ctx, err_str);
+                } else {
+                    JSValue args[2];
+                    args[0] = JS_NULL;
+                    args[1] = JS_NewString(ctx, msg->error);
+                    /* onMessage(null, error) */
+                    /* Actually we call with (data) where data is the error string
+                     * since our TS layer expects onMessage(data: string) */
+                }
+                /* Mark connection as closed */
+                atomic_store(&conn->state, 2);
+            } else if (msg->message) {
+                /* Normal message — deliver to onMessage callback */
+                JSValue data_str = JS_NewString(ctx, msg->message);
+                JS_Call(ctx, conn->on_message_cb, JS_UNDEFINED, 1, &data_str);
+                JS_FreeValue(ctx, data_str);
+            }
+        }
+
+        /* Free message data */
+        free(msg->message);
+        free(msg->error);
+        msg->message = NULL;
+        msg->error = NULL;
+
+        rh = (rh + 1) % MAX_WS_MESSAGES;
+        atomic_store_explicit(&ws_read_head, rh, memory_order_release);
+    }
+
+    /* Clean up closed connections */
+    int i = 0;
+    while (i < ws_count) {
+        PendingWSConnection *conn = ws_connections[i];
+        if (atomic_load(&conn->state) == 2) {
+            /* Fire onClose callback if not already fired */
+            if (!JS_IsUndefined(conn->on_close_cb)) {
+                JS_Call(ctx, conn->on_close_cb, JS_UNDEFINED, 0, NULL);
+            }
+            /* Free JS callbacks */
+            if (!JS_IsUndefined(conn->on_message_cb))
+                JS_FreeValue(ctx, conn->on_message_cb);
+            if (!JS_IsUndefined(conn->on_close_cb))
+                JS_FreeValue(ctx, conn->on_close_cb);
+            free(conn);
+
+            /* Compact */
+            ws_count--;
+            if (i < ws_count) {
+                ws_connections[i] = ws_connections[ws_count];
+            }
+        } else {
+            i++;
+        }
+    }
+}
+
+/* ── Query: are there any active WebSocket connections? ────────── */
+
+int wdk_ws_has_pending(void) {
+    return ws_count > 0;
+}
+
 /* ── Registration ────────────────────────────────────────────── */
 
 void wdk_register_net_bridge(JSContext *ctx, const WDKNetProvider *provider) {
@@ -352,6 +638,20 @@ void wdk_register_net_bridge(JSContext *ctx, const WDKNetProvider *provider) {
 
     JS_SetPropertyStr(ctx, net, "fetch",
         JS_NewCFunction(ctx, js_net_fetch, "fetch", 2));
+
+    /* WebSocket functions (only if platform supports them) */
+    if (provider->ws_connect) {
+        JS_SetPropertyStr(ctx, net, "wsConnect",
+            JS_NewCFunction(ctx, js_net_ws_connect, "wsConnect", 1));
+        JS_SetPropertyStr(ctx, net, "wsSend",
+            JS_NewCFunction(ctx, js_net_ws_send, "wsSend", 2));
+        JS_SetPropertyStr(ctx, net, "wsClose",
+            JS_NewCFunction(ctx, js_net_ws_close, "wsClose", 1));
+        JS_SetPropertyStr(ctx, net, "wsOnMessage",
+            JS_NewCFunction(ctx, js_net_ws_on_message, "wsOnMessage", 2));
+        JS_SetPropertyStr(ctx, net, "wsOnClose",
+            JS_NewCFunction(ctx, js_net_ws_on_close, "wsOnClose", 2));
+    }
 
     JS_SetPropertyStr(ctx, native_obj, "net", net);
 

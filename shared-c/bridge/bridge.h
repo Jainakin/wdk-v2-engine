@@ -44,6 +44,12 @@ typedef struct {
                   const uint8_t *body, size_t body_len,
                   int timeout_ms, void *context,
                   WDKFetchCallback callback);
+    /* WebSocket — all three may be NULL if WS not supported on this platform */
+    void *(*ws_connect)(const char *url, void *context,
+                        void (*on_message)(void *context, const char *message,
+                                           const char *error));
+    void (*ws_send)(void *ws_handle, const char *data);
+    void (*ws_close)(void *ws_handle);
 } WDKNetProvider;
 
 /*
