@@ -307,6 +307,142 @@ static JSValue js_crypto_sign_secp256k1(JSContext *ctx,
     return js_new_uint8array(ctx, sig_compact, 64);
 }
 
+/* ── native.crypto.signRecoverableSecp256k1(keyHandle, hash32) → 65 bytes ── */
+/* Returns 65 bytes: 64-byte compact signature + 1-byte recovery ID.          */
+
+#include "secp256k1_recovery.h"
+
+static JSValue js_crypto_sign_recoverable_secp256k1(JSContext *ctx,
+                                                      JSValueConst this_val,
+                                                      int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "keyHandle and hash required");
+
+    int32_t handle;
+    JS_ToInt32(ctx, &handle, argv[0]);
+
+    size_t hash_len;
+    uint8_t *hash = js_get_uint8array(ctx, argv[1], &hash_len);
+    if (!hash || hash_len != 32)
+        return JS_ThrowTypeError(ctx, "Hash must be 32 bytes");
+
+    size_t key_len;
+    int curve;
+    const uint8_t *key_bytes = wdk_key_store_get(handle, &key_len, &curve);
+    if (!key_bytes)
+        return JS_ThrowRangeError(ctx, "Invalid key handle");
+
+    const uint8_t *privkey = key_bytes;
+
+    secp256k1_context *secp_ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN);
+    secp256k1_ecdsa_recoverable_signature rsig;
+
+    int ret = secp256k1_ecdsa_sign_recoverable(secp_ctx, &rsig, hash, privkey,
+                                                 NULL, NULL);
+    if (!ret) {
+        secp256k1_context_destroy(secp_ctx);
+        return JS_ThrowInternalError(ctx, "secp256k1 recoverable sign failed");
+    }
+
+    uint8_t output[65];
+    int recid;
+    secp256k1_ecdsa_recoverable_signature_serialize_compact(
+        secp_ctx, output, &recid, &rsig);
+    output[64] = (uint8_t)recid;
+
+    secp256k1_context_destroy(secp_ctx);
+    return js_new_uint8array(ctx, output, 65);
+}
+
+/* ── native.crypto.verifySecp256k1(publicKey33, hash32, signature64) → bool ── */
+
+static JSValue js_crypto_verify_secp256k1(JSContext *ctx,
+                                            JSValueConst this_val,
+                                            int argc, JSValueConst *argv) {
+    if (argc < 3) return JS_ThrowTypeError(ctx, "publicKey, hash, and signature required");
+
+    size_t pk_len, hash_len, sig_len;
+    uint8_t *pk_bytes   = js_get_uint8array(ctx, argv[0], &pk_len);
+    uint8_t *hash       = js_get_uint8array(ctx, argv[1], &hash_len);
+    uint8_t *sig_compact = js_get_uint8array(ctx, argv[2], &sig_len);
+
+    if (!pk_bytes || (pk_len != 33 && pk_len != 65))
+        return JS_ThrowTypeError(ctx, "Public key must be 33 or 65 bytes");
+    if (!hash || hash_len != 32)
+        return JS_ThrowTypeError(ctx, "Hash must be 32 bytes");
+    if (!sig_compact || sig_len != 64)
+        return JS_ThrowTypeError(ctx, "Signature must be 64 bytes (compact)");
+
+    secp256k1_context *secp_ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_VERIFY);
+
+    secp256k1_pubkey pubkey;
+    if (!secp256k1_ec_pubkey_parse(secp_ctx, &pubkey, pk_bytes, pk_len)) {
+        secp256k1_context_destroy(secp_ctx);
+        return JS_FALSE;
+    }
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_signature_parse_compact(secp_ctx, &sig, sig_compact)) {
+        secp256k1_context_destroy(secp_ctx);
+        return JS_FALSE;
+    }
+
+    /* Normalize to low-S before verifying (BIP-62) */
+    secp256k1_ecdsa_signature_normalize(secp_ctx, &sig, &sig);
+
+    int result = secp256k1_ecdsa_verify(secp_ctx, &sig, hash, &pubkey);
+    secp256k1_context_destroy(secp_ctx);
+
+    return result ? JS_TRUE : JS_FALSE;
+}
+
+/* ── native.crypto.recoverSecp256k1(hash32, signature65) → Uint8Array(33) ── */
+/* Recovers compressed public key from a recoverable signature.               */
+
+static JSValue js_crypto_recover_secp256k1(JSContext *ctx,
+                                             JSValueConst this_val,
+                                             int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "hash and signature required");
+
+    size_t hash_len, sig_len;
+    uint8_t *hash = js_get_uint8array(ctx, argv[0], &hash_len);
+    uint8_t *sig_bytes = js_get_uint8array(ctx, argv[1], &sig_len);
+
+    if (!hash || hash_len != 32)
+        return JS_ThrowTypeError(ctx, "Hash must be 32 bytes");
+    if (!sig_bytes || sig_len != 65)
+        return JS_ThrowTypeError(ctx, "Signature must be 65 bytes (64 compact + 1 recid)");
+
+    int recid = sig_bytes[64];
+    if (recid < 0 || recid > 3)
+        return JS_ThrowRangeError(ctx, "Recovery ID must be 0-3");
+
+    secp256k1_context *secp_ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_VERIFY);
+
+    secp256k1_ecdsa_recoverable_signature rsig;
+    if (!secp256k1_ecdsa_recoverable_signature_parse_compact(
+            secp_ctx, &rsig, sig_bytes, recid)) {
+        secp256k1_context_destroy(secp_ctx);
+        return JS_ThrowInternalError(ctx, "Failed to parse recoverable signature");
+    }
+
+    secp256k1_pubkey pubkey;
+    if (!secp256k1_ecdsa_recover(secp_ctx, &pubkey, &rsig, hash)) {
+        secp256k1_context_destroy(secp_ctx);
+        return JS_ThrowInternalError(ctx, "Public key recovery failed");
+    }
+
+    uint8_t output[33];
+    size_t output_len = 33;
+    secp256k1_ec_pubkey_serialize(secp_ctx, output, &output_len,
+                                   &pubkey, SECP256K1_EC_COMPRESSED);
+    secp256k1_context_destroy(secp_ctx);
+
+    return js_new_uint8array(ctx, output, 33);
+}
+
 /* ── native.crypto.signEd25519(keyHandle, message) ─────────── */
 
 static JSValue js_crypto_sign_ed25519(JSContext *ctx,
@@ -782,6 +918,12 @@ void wdk_register_crypto_bridge(JSContext *ctx) {
         JS_NewCFunction(ctx, js_crypto_derive_key, "deriveKey", 2));
     JS_SetPropertyStr(ctx, crypto, "signSecp256k1",
         JS_NewCFunction(ctx, js_crypto_sign_secp256k1, "signSecp256k1", 2));
+    JS_SetPropertyStr(ctx, crypto, "signRecoverableSecp256k1",
+        JS_NewCFunction(ctx, js_crypto_sign_recoverable_secp256k1, "signRecoverableSecp256k1", 2));
+    JS_SetPropertyStr(ctx, crypto, "verifySecp256k1",
+        JS_NewCFunction(ctx, js_crypto_verify_secp256k1, "verifySecp256k1", 3));
+    JS_SetPropertyStr(ctx, crypto, "recoverSecp256k1",
+        JS_NewCFunction(ctx, js_crypto_recover_secp256k1, "recoverSecp256k1", 2));
     JS_SetPropertyStr(ctx, crypto, "signEd25519",
         JS_NewCFunction(ctx, js_crypto_sign_ed25519, "signEd25519", 2));
     JS_SetPropertyStr(ctx, crypto, "getPublicKey",
