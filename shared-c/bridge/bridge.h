@@ -10,6 +10,25 @@
 
 #include "engine.h"
 #include "key_store.h"
+#include <string.h>
+
+/*
+ * Platform-aware secure memory zeroing.
+ * Prevents compiler dead-store elimination of buffer clears.
+ * Used by all bridge functions that handle secret material.
+ */
+static inline void secure_zero(void *ptr, size_t len) {
+#if defined(__APPLE__)
+    memset(ptr, 0, len);
+    __asm__ __volatile__("" : : "r"(ptr) : "memory");
+#elif defined(__linux__) || defined(__ANDROID__)
+    extern void explicit_bzero(void *, size_t);
+    explicit_bzero(ptr, len);
+#else
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len--) *p++ = 0;
+#endif
+}
 
 /* Forward declare JSContext for bridge registration */
 struct JSContext;

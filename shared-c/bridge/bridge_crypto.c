@@ -23,7 +23,7 @@
  */
 
 #include "../vendor/quickjs-ng/quickjs.h"
-#include "key_store.h"
+#include "bridge.h"    /* includes key_store.h + secure_zero() */
 #include "../hashing/sha256.h"
 #include "../hashing/sha512.h"
 #include "../hashing/hmac.h"
@@ -215,6 +215,7 @@ static JSValue js_crypto_derive_key(JSContext *ctx,
     if (key_len == 64) {
         /* It's a seed — derive master key first */
         if (wdk_bip32_from_seed(key_bytes, key_len, &master) != 0) {
+            wdk_bip32_key_wipe(&master);  /* zero any partial state */
             JS_FreeCString(ctx, path);
             return JS_ThrowInternalError(ctx, "Failed to derive master key");
         }
@@ -230,6 +231,8 @@ static JSValue js_crypto_derive_key(JSContext *ctx,
 
     wdk_bip32_key derived;
     if (wdk_bip32_derive_path(&master, path, &derived) != 0) {
+        wdk_bip32_key_wipe(&master);   /* zero seed-derived material */
+        wdk_bip32_key_wipe(&derived);   /* zero any partial derivation */
         JS_FreeCString(ctx, path);
         return JS_ThrowInternalError(ctx, "Failed to derive key at path");
     }
@@ -484,7 +487,10 @@ static JSValue js_crypto_sign_ed25519(JSContext *ctx,
     /* Sign: output is signature (64 bytes) prepended to message */
     size_t sm_len = msg_len + 64;
     uint8_t *sm = malloc(sm_len);
-    if (!sm) return JS_ThrowInternalError(ctx, "Out of memory");
+    if (!sm) {
+        secure_zero(sk, sizeof(sk));  /* wipe key material before error return */
+        return JS_ThrowInternalError(ctx, "Out of memory");
+    }
 
     unsigned long long smlen;
     int ret = crypto_sign_ed25519_tweet(sm, &smlen, msg, msg_len, sk);
@@ -702,11 +708,13 @@ static JSValue js_crypto_pbkdf2(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, pw_buf); JS_FreeValue(ctx, salt_buf);
 
     if (rc != 0) {
+        secure_zero(out, key_len);  /* wipe derived key on error */
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "PBKDF2 failed");
     }
 
     JSValue ab = JS_NewArrayBufferCopy(ctx, out, key_len);
+    secure_zero(out, key_len);  /* wipe derived key after copying to JS */
     js_free(ctx, out);
 
     JSValue global = JS_GetGlobalObject(ctx);
@@ -772,11 +780,13 @@ static JSValue js_crypto_hkdf(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, ikm_buf); JS_FreeValue(ctx, salt_buf); JS_FreeValue(ctx, info_buf);
 
     if (rc != 0) {
+        secure_zero(out, key_len);  /* wipe derived key on error */
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "HKDF failed");
     }
 
     JSValue ab = JS_NewArrayBufferCopy(ctx, out, key_len);
+    secure_zero(out, key_len);  /* wipe derived key after copying to JS */
     js_free(ctx, out);
 
     JSValue global = JS_GetGlobalObject(ctx);
@@ -868,11 +878,13 @@ static JSValue js_crypto_aes_gcm_decrypt(JSContext *ctx, JSValueConst this_val,
     int rc = wdk_aes_gcm_decrypt(key, iv, ciphertext, ct_len, NULL, 0, out);
     JS_FreeValue(ctx, dk_buf); JS_FreeValue(ctx, dct_buf); JS_FreeValue(ctx, div_buf);
     if (rc != 0) {
+        secure_zero(out, pt_len);  /* wipe partial plaintext on auth failure */
         js_free(ctx, out);
         return JS_ThrowInternalError(ctx, "AES-GCM decrypt failed: authentication tag mismatch");
     }
 
     JSValue ab = JS_NewArrayBufferCopy(ctx, out, pt_len);
+    secure_zero(out, pt_len);  /* wipe plaintext after copying to JS */
     js_free(ctx, out);
 
     JSValue global = JS_GetGlobalObject(ctx);

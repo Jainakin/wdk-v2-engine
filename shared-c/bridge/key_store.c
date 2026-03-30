@@ -6,27 +6,7 @@
  * must serialize access if needed.
  */
 
-#include "key_store.h"
-#include <string.h>
-
-/* ---------- secure zeroing ------------------------------------------------ */
-
-#if defined(__APPLE__)
-/* Use memset + compiler barrier to prevent dead-store elimination */
-static void secure_zero(void *p, size_t n)
-{
-    memset(p, 0, n);
-    __asm__ __volatile__("" : : "r"(p) : "memory");
-}
-#elif defined(__ANDROID__) || defined(__linux__)
-#define secure_zero(ptr, len) explicit_bzero(ptr, len)
-#else
-static void secure_zero(void *p, size_t n)
-{
-    volatile unsigned char *vp = (volatile unsigned char *)p;
-    while (n--) *vp++ = 0;
-}
-#endif
+#include "bridge.h"  /* includes key_store.h + secure_zero() */
 
 /* ---------- internal data ------------------------------------------------- */
 

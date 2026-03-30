@@ -258,6 +258,7 @@ int wdk_bip39_generate_mnemonic_from_entropy(const uint8_t *entropy, size_t entr
 
         if (idx >= BIP39_WORDLIST_COUNT || bip39_wordlist[idx] == NULL) {
             secure_wipe(data, sizeof(data));
+            secure_wipe(hash, sizeof(hash));
             return -1; /* Wordlist not fully populated */
         }
 
@@ -268,6 +269,7 @@ int wdk_bip39_generate_mnemonic_from_entropy(const uint8_t *entropy, size_t entr
         size_t needed = wlen + (i < word_count - 1 ? 1 : 1); /* space or NUL */
         if (written + needed > out_size) {
             secure_wipe(data, sizeof(data));
+            secure_wipe(hash, sizeof(hash));
             return -2; /* Buffer too small */
         }
 
