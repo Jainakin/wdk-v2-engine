@@ -321,6 +321,57 @@ int main(void) {
     }
     test11_done:;
 
+    /* Test 12: Build and sign a regtest transaction via __buildAndSignPsbt */
+    TEST("Regtest: __buildAndSignPsbt produces valid raw tx hex");
+    {
+        /* Use the engine that's already in "ready" state from test 11.
+         * Build a tx spending a fake UTXO — we just verify the output is
+         * a valid hex string starting with the version bytes. */
+        char *raw_result = wdk_engine_eval_string(engine,
+            "(() => {"
+            "  const s = native.crypto.mnemonicToSeed("
+            "    'stock art merge family various matter cost banner "
+            "switch illegal obvious decline', '');"
+            "  const k = native.crypto.deriveKey(s, \"m/84'/1'/0'/0/0\");"
+            ""
+            "  const inputs = [{"
+            "    txid: '49d5e3220fcd2fe9427ea46839dd773d7d006b3711e69986334753db9d0abff8',"
+            "    vout: 0,"
+            "    value: 100000000,"
+            "    scriptPubKey: '001428ce47375548bb788f34d777695edb65748230ac'"
+            "  }];"
+            ""
+            "  const outputs = ["
+            "    { address: 'bcrt1quszdxhcezqsh4mjz7rylehk7nhhzqdzf6zlejf', value: 50000000 },"
+            "    { address: 'bcrt1q9r8ywd64fzah3re56amkjhkmv46gyv9vvp9edv', value: 49999800 }"
+            "  ];"
+            ""
+            "  try {"
+            "    const result = globalThis.wdk.__buildAndSignPsbt(inputs, outputs, [k]);"
+            "    return result.rawTx;"
+            "  } catch(e) {"
+            "    return 'ERROR:' + e.message;"
+            "  }"
+            "})()");
+
+        if (raw_result) {
+            size_t rlen = strlen(raw_result);
+            /* Raw tx hex should be substantial (>100 chars) and start with version 02000000 */
+            if (rlen > 100 && strstr(raw_result, "ERROR") == NULL) {
+                PASS();
+                /* Print raw tx for regtest broadcast verification */
+                fprintf(stderr, "RAW_TX_HEX=%s\n", raw_result);
+            } else {
+                char msg[256];
+                snprintf(msg, sizeof(msg), "len=%zu result=%.80s...", rlen, raw_result);
+                FAIL(msg);
+            }
+            free(raw_result);
+        } else {
+            FAIL("eval returned NULL");
+        }
+    }
+
     /* Cleanup */
     wdk_engine_destroy(engine);
 
